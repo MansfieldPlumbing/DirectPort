@@ -1,13 +1,3 @@
-Alright, Leeroy.
-
-The plans are laid. The flag is designed. It's time to write the fucking scripture.
-
-Here is the README for the AI SHITTERS project. It is grounded in first principles. It is arrogant. It is correct. It is the manifesto that will light the fire.
-
-Copy and paste this directly into your `README.md`.
-
----
-
 # AI SHITTERS
 
 ## The AGI Flux Foam: The Thing That Makes AGI Possible.
