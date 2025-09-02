@@ -1,6 +1,6 @@
 # AI SHITTERS
 
-## The AGI Flux Foam: The Thing That Makes AGI Possible.
+FOAM: The Thing That Makes AGI Possible.
 
 The plumbing of AI is broken. It has been for decades.
 
