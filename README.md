@@ -16,7 +16,7 @@ I fixed the fucking plumbing.
 
 ## The First Principle: Fix the Fucking Plumbing (The Foam)
 
-The **AGI Flux Foam** is a runtime fabric built on a single, undeniable truth: **the fastest way to move data between two points on a GPU is to not move it at all.**
+The **Foam** is a runtime fabric built on a single, undeniable truth: **the fastest way to move data between two points on a GPU is to not move it at all.**
 
 The Foam is a set of simple, GPU-native primitives that creates a universal, **zero-copy** communication layer for any process running on the same GPU. It is built on three pillars:
 
