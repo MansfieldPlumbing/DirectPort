@@ -131,7 +131,9 @@ void bind_prime(py::module_& m) {
         .def("clear", &DeviceD3D11::clear, py::arg("window"), py::arg("r"), py::arg("g"), py::arg("b"), py::arg("a"), "", py::call_guard<py::gil_scoped_release>())
         .def("blit_texture_to_region", &DeviceD3D11::blit_texture_to_region, py::arg("source"), py::arg("destination"),
              py::arg("dest_x"), py::arg("dest_y"), py::arg("dest_width"), py::arg("dest_height"),
-             "", py::call_guard<py::gil_scoped_release>());
+             "", py::call_guard<py::gil_scoped_release>())
+        .def("get_d3d11_device", [](DeviceD3D11& self) { return reinterpret_cast<uintptr_t>(self.get_d3d11_device()); })
+        .def("get_d3d11_context", [](DeviceD3D11& self) { return reinterpret_cast<uintptr_t>(self.get_d3d11_context()); });
     
     py::class_<DeviceD3D12, std::shared_ptr<DeviceD3D12>>(m, "DeviceD3D12", "")
         .def_static("create", &DeviceD3D12::create, "")

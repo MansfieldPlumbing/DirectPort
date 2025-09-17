@@ -11,7 +11,8 @@ namespace py = pybind11;
 void bind_prime(py::module_& m);
 void bind_numpy(py::module_& m);
 void bind_camera(py::module_& m);
-
+void bind_onnx(py::module_& m);
+void bind_gl(py::module_& m);
 
 // PYBIND11_MODULE defines the entry point for the 'directport' kingdom.
 PYBIND11_MODULE(directport, m) {
@@ -22,4 +23,6 @@ PYBIND11_MODULE(directport, m) {
     bind_prime(m);
     bind_numpy(m);
     bind_camera(m);
+    bind_onnx(m);
+    bind_gl(m);
 }

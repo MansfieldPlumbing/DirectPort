@@ -145,9 +145,8 @@ namespace DirectPort {
         void blit_texture_to_region(std::shared_ptr<Texture> source, std::shared_ptr<Texture> destination,
                                     uint32_t dest_x, uint32_t dest_y, uint32_t dest_width, uint32_t dest_height) override;
 
-    // --- ADD THESE TWO LINES ---
-    ID3D11Device* get_d3d11_device();
-    ID3D11DeviceContext* get_d3d11_context();
+        ID3D11Device* get_d3d11_device();
+        ID3D11DeviceContext* get_d3d11_context();
 
     private:
         DeviceD3D11();
