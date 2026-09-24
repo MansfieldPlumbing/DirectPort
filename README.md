@@ -1,204 +1,114 @@
-
+<div align="center">
+  <img src="docs/directport.png" width="220" alt="DirectPort Logo" style="border-radius: 8px;" />
+  <h1>DirectPort</h1>
+  <p><strong>Hardware-Fenced Inter-Process GPU Memory Conduit for Windows</strong></p>
+  <p><em>Archived Predecessor Architecture // Retained for NT Handle &amp; Hardware Fence Benchmark Reference</em></p>
+</div>
 
 ---
 
-# DirectPort
+> [!NOTE]
+> **ARCHIVE STATUS & SUCCESSOR ARCHITECTURE**  
+> DirectPort is an archived milestone. It is retained to document the hardware-synchronized NT handle primitives and Direct2D/DirectComposition SMA bindings developed during this research phase.
+> * **Successor for Memory Pipelines**: **[dpx](https://github.com/MansfieldPlumbing/DPX)** — Push-based, lock-free SPSC dataflow inference runtime with zero-copy UMA memory transit.
+> * **Successor for Native Windows Runtime**: **[QuickPS](https://github.com/MansfieldPlumbing/QuickPS)** — Zero-dependency Windows runtime with in-memory `[Reflection.Emit]` COM vtables and WASAPI audio capture.
 
-**A high-performance C++ library with Python bindings for zero-copy GPU texture and data sharing across processes and graphics APIs (DirectX 11, DirectX 12, OpenGL).**
+---
 
-![Language](https://img.shields.io/badge/Language-C%2B%2B%20%26%20Python-blue.svg)![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)![License](https://img.shields.io/badge/License-MIT-green.svg)![Graphics APIs](https://img.shields.io/badge/APIs-D3D11%20%7C%20D3D12%20%7C%20OpenGL-orange.svg)
+## 1. Architectural Scope & Retrospective
 
-DirectPort is a developer-focused toolkit engineered for advanced, low-latency GPU communication. It enables applications to share textures directly from GPU memory, eliminating the performance-intensive step of copying data through the CPU. It provides a unified interface over multiple graphics APIs and includes powerful Python bindings for rapid development and integration with ML and scientific computing libraries.
+DirectPort solved a fundamental Windows graphics bottleneck: **sharing GPU memory between distinct operating system processes without CPU staging or host RAM loopbacks**.
 
-## What is DirectPort?
+By proxying DirectX 12 hardware fences through Windows NT named handles (`CreateSharedHandle` / `OpenSharedHandleByName`), producer processes signal GPU completion directly to consumer command queues. Consumers unblock at physical PCIe crossbar latency (**~170 ns**) rather than waiting for Windows thread scheduler quantum boundaries (1–15 ms).
 
-DirectPort establishes a robust producer-consumer framework for sharing GPU resources on Windows. One or more applications can act as **Producers**, creating and updating textures on the GPU. Other applications can act as **Consumers**, discovering and reading these textures in real-time with minimal overhead.
+### Plain Concession: The Frame & Video Paradigm
 
-This is achieved using a "zero-copy" approach, where different processes can access the same surface in GPU memory, synchronized with native GPU fences for maximum performance.
+DirectPort was conceptualized around **textures, video frames, framebuffers, and camera streams**. It approached GPU IPC through the lens of video delivery (DirectX 11/12 textures, Media Foundation sources, display composition) rather than general tensor computation DAGs or push-based token dataflow. 
 
-## Who is this for?
+While highly effective for multi-process video multiplexing and real-time display compositing, the frame-based abstraction introduces unnecessary boundaries when applied to continuous machine learning workloads. Those lessons directly prompted the shift toward lock-free, double-buffered node isolation in **dpx**.
 
-*   **Live Broadcast & Streaming Developers:** Build real-time video mixers, switchers, and effects pipelines.
-*   **AI/ML Engineers:** Run GPU-accelerated ONNX models directly on live video streams for object detection, style transfer, or real-time analysis without ever leaving the GPU.
-*   **Creative Coders & VJ Artists:** Mix and composite visuals from multiple applications and sources in real-time.
-*   **Data Scientists & Researchers:** Visualize massive NumPy datasets on the GPU without the bottleneck of CPU-GPU data transfers.
-*   **Game & Engine Developers:** Create plugins and tools that can share render targets or video feeds between separate applications.
+### Quarantining the Python Prototype
 
-## Core Features
+Early versions of DirectPort included Python bindings (`pybind11`), ONNX Runtime DirectML integrations, and NumPy buffer bridges. 
 
-DirectPort is structured into several powerful, interoperable modules:
+Tethering a sub-microsecond GPU IPC conduit to Python's Global Interpreter Lock (GIL) and runtime overhead proved to be an architectural mismatch. All Python bindings and demonstration scripts have been strictly quarantined under [`legacy/python/`](legacy/python/). The core systems engineering lives in native C++ and PowerShell SMA.
 
-*   **🖥️ Multi-API Graphics Core (D3D11/D3D12/OpenGL):**
-    *   Create windows and render targets using DirectX 11, DirectX 12, or modern OpenGL.
-    *   Share textures seamlessly between processes, even if they are using different graphics APIs.
-    *   A powerful `discover()` function automatically finds all running DirectPort producers on the system.
-    *   Apply custom HLSL or GLSL shaders to textures on the GPU.
+---
 
-*   **🚀 GPU-Accelerated Machine Learning (ONNX Runtime):**
-    *   Load ONNX models and run inference directly on shared GPU textures using the DirectML execution provider.
-    *   Enables true zero-copy AI pipelines: video frame -> GPU -> AI model -> result, with no CPU round-trip.
+## 2. Repository Layout
 
-*   **🔬 High-Performance NumPy Integration:**
-    *   `directport.numpy.write_texture()`: Upload a NumPy array's contents directly into a D3D11 texture.
-    *   `directport.numpy.read_texture()`: Download a D3D11 texture's contents directly into a new NumPy array.
-    *   Massively accelerates visualization and GPU-based processing of CPU-generated data.
-
-*   **📷 High-Performance Camera Input:**
-    *   A dedicated `DirectPortCamera` class provides a high-performance, low-latency video capture source using Windows Media Foundation.
-    *   Frames can be delivered as NumPy arrays for CPU processing (e.g., with OpenCV) or rendered directly to a GPU texture.
-
-## Getting Started
-
-### Prerequisites
-
-1.  **Windows 10/11:** The library uses modern Windows graphics features.
-2.  **Visual Studio 2022:** With the "Desktop development with C++" workload.
-3.  **CMake:** Version 3.15 or higher.
-4.  **vcpkg:** The C++ package manager. DirectPort uses `vcpkg` to manage dependencies like `pybind11`, `glew`, and `wil`.
-
-### Installation
-
-1.  **Install Dependencies with vcpkg:**
-    ```bash
-    # Clone vcpkg if you haven't already
-    git clone https://github.com/microsoft/vcpkg
-    ./vcpkg/bootstrap-vcpkg.bat
-
-    # Install DirectPort's dependencies
-    ./vcpkg/vcpkg install glew pybind11 wil onnxruntime-gpu --triplet x64-windows
-    ```
-
-2.  **Configure and Build with CMake:**
-    ```bash
-    # Create a build directory
-    mkdir build
-    cd build
-
-    # Configure the project, pointing to your vcpkg installation
-    cmake .. -DCMAKE_TOOLCHAIN_FILE=[path-to-vcpkg]/scripts/buildsystems/vcpkg.cmake
-
-    # Build the project (e.g., in Release mode)
-    cmake --build . --config Release
-    ```
-
-3.  **Locate the Module:** The compiled Python module (`directport.pyd`) will be in the `build\Release` (or `build\Debug`) directory. The example Python scripts can be run from the project root and will automatically find this module.
-
-## Quickstart Examples
-
-The `src/Scripts` directory contains a wealth of examples. To run them, simply navigate to the project's root directory and execute the script.
-
-### 1. D3D12 Shader Producer & D3D11 Consumer
-
-This demonstrates the core cross-API texture sharing capability.
-
--   **Start the Producer:** Run one of the C++ example producers.
-    ```bash
-    # Open a terminal in the project root
-    ./build/Release/DirectPortShaderProducerD3D12.exe
-    ```
--   **Start the Consumer:** In a separate terminal, run the Python D3D11 consumer.
-    ```bash
-    python src/Scripts/pyconsumer11.py
-    ```
-    The Python window will automatically discover and display the stream from the C++ D3D12 application.
-
-### 2. Live Camera Feed to NumPy
-
-Capture your webcam feed directly into a NumPy array for analysis.
-
-```bash
-python src/Scripts/numpytest.py
-```
-
-### 3. Multiplexing (Compositing) Streams
-
-Start multiple producers (e.g., `DirectPortProducerD3D11.exe` and `DirectPortCamera.exe`). Then run the multiplexer to see them composited into a single new stream.
-
-```bash
-# Start producers in separate terminals...
-./build/Release/DirectPortProducerD3D11.exe
-./Binaries/DirectPortCamera.exe
-
-# Start the multiplexer in a third terminal
-python src/Scripts/pymultiplexer12.py
-```
-
-### 4. Zero-Copy ONNX Inference
-
-Run a simple "add 1.0" filter on a GPU texture using ONNX Runtime.
-
-```bash
-python src/Scripts/onnxtest.py
-```
-
-## API Overview
-
-### D3D11 / D3D12
-
-The core API is nearly identical for both DirectX versions.
-
-```python
-import directport
-
-# 1. Create a device
-device = directport.DeviceD3D11.create() # or DeviceD3D12
-
-# 2. Create a window and a texture
-window = device.create_window(1280, 720, "My Window")
-texture = device.create_texture(1280, 720, directport.DXGI_FORMAT.B8G8R8A8_UNORM)
-
-# 3. Create a producer to share the texture
-producer = device.create_producer("my_stream_name", texture)
-
-# 4. Main loop
-while window.process_events():
-    # Render something into `texture` using apply_shader...
-    device.apply_shader(output=texture, shader=b"...")
-    
-    # Signal that a new frame is ready for consumers
-    producer.signal_frame()
-    
-    # Show the result in our local window
-    device.blit(texture, window)
-    window.present()
-```
-
-### OpenGL
-
-The OpenGL module provides a unified API that internally manages interop with DirectX for sharing.
-
-```python
-import directport.gl as dp_gl
-
-# 1. Create an OpenGL device
-device = dp_gl.Device.create()
-window = device.create_window(800, 600, "OpenGL Producer")
-
-# 2. Create a texture and a producer
-texture = device.create_texture(800, 600, dp_gl.DXGI_FORMAT.R8G8B8A8_UNORM)
-producer = device.create_producer("my_gl_stream", texture)
-
-# 3. Main loop
-while window.process_events():
-    # Make the window's context current
-    window.make_current()
-    
-    # Render to texture using apply_shader...
-    device.apply_shader(output=texture, glsl_fragment_shader="...")
-    
-    # Signal and present
-    producer.signal_frame()
-    device.blit(texture, window)
-    window.present()
+```text
+DirectPort/
+├── docs/
+│   └── directport.png            # DirectPort hardware die & VRAM badge
+├── src/
+│   ├── sdk/                      # Clean, minimal C-API transport layer
+│   │   ├── directport.h          # Public C API header & format definitions
+│   │   ├── directportd3d12.cpp   # D3D12 resource creation, fences, NT handle resolver
+│   │   └── directportd3d11.cpp   # D3D11 compatibility layer & texture sharing
+│   ├── sma/                      # DirectPortSMA: Native PowerShell / SMA engine
+│   │   ├── DirectPort.Canvas2D.Native.cpp  # Direct2D / DirectWrite canvas rendering
+│   │   ├── DirectPort.Console.Native.cpp   # High-throughput console presentation
+│   │   ├── DirectPort.PowerShell.cpp       # Native unmanaged SMA bridge
+│   │   ├── DirectPort.Shader.Native.cpp    # In-memory HLSL shader compilation
+│   │   └── SMA.cpp                         # Native SMA runspace hosting
+│   ├── ipc/                      # Windows Shell & Context Menu IPC
+│   │   ├── menudump.cpp          # Windows Explorer context menu interception
+│   │   ├── menudump.def          # Shell extension export definition
+│   │   ├── ipc.cpp               # Out-of-process menu graph transport
+│   │   └── shell-reg.ps1         # Shell extension registration script
+│   ├── presentation/             # DirectComposition & Shader Surfaces
+│   │   ├── DCompSurface/         # DirectComposition visual tree integration
+│   │   └── ShaderSurface/        # Standalone D3D12 shader surfaces (ps2orb)
+│   └── apps/                     # Native Applications
+│       └── RecordKit/            # Low-latency WASAPI float-PCM audio recorder
+└── legacy/                       # Historical prototypes
+    ├── DirectPort/               # Original 2025 C++ implementation
+    ├── Examples/                 # Native C++ examples
+    └── python/                   # Quarantined Python bindings & scripts
 ```
 
 ---
 
+## 3. The Core C-API (`src/sdk`)
+
+The production SDK layer provides a minimal, dependency-free C API for inter-process GPU memory sharing:
+
+```c
+#include "directport.h"
+
+// 1. Initialize subsystem (once per process)
+dp12_init();
+
+// 2. Producer: Create shared D3D12 resource with NT handle names
+DP_HANDLE port = dp12_create_shared_resource(
+    1920, 1080, DP_FORMAT_VIDEO, /*is_system_ram=*/false,
+    L"DirectPort_SharedTexture", L"DirectPort_SharedFence"
+);
+
+// 3. Signal completion on GPU command queue
+dp12_signal_fence(port, frame_counter++);
+
+// 4. Consumer: Open by NT name and queue asynchronous GPU hardware wait
+DP_HANDLE consumer = dp12_open_shared_resource(
+    L"DirectPort_SharedTexture", L"DirectPort_SharedFence"
+);
+dp12_queue_wait(consumer, pCommandQueue, completed_value);
+// GPU unblocks at ~170ns PCIe crossbar latency. Zero CPU intervention.
+```
 
 ---
-LICENSE
+
+## 4. Lineage: Evolution into QuickPS
+
+The native PowerShell bindings in [`src/sma/`](src/sma/) and the WASAPI audio capture in [`src/apps/RecordKit/`](src/apps/RecordKit/) represent the key evolutionary bridge to **[QuickPS](https://github.com/MansfieldPlumbing/QuickPS)**:
+
+1. **Phase 1 (DirectPort C++)**: Proved GPU VRAM sharing via NT handles and DX12 fences.
+2. **Phase 2 (DirectPortSMA)**: Integrated D3D12, Direct2D, and WASAPI audio into PowerShell via unmanaged C++ DLL shims.
+3. **Phase 3 (QuickPS)**: Eliminated the C++ compilation step entirely by using `[Reflection.Emit]` to synthesize COM vtables and Win32 message pumps dynamically in-memory.
+
 ---
 
-MIT. Use it. Build on it. 
+## License
 
--Mr. Mansfield
+MIT License. See [LICENSE](LICENSE) for details.
