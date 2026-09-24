@@ -1,0 +1,18 @@
+# Build outputs & caches
+build/
+.vs/
+out/
+bin/
+obj/
+*.obj
+*.pdb
+*.ilk
+*.tlog
+*.idb
+*.VC.db
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+*.swp
+*~

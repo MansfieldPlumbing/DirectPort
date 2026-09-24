@@ -35,77 +35,124 @@ Tethering a sub-microsecond GPU IPC conduit to Python's Global Interpreter Lock 
 
 ---
 
-## 2. Repository Layout
+## 2. Spout for D3D12 — Modernized Hardware Crossbar
+
+DirectPort fills the role of **Spout (and macOS Syphon) natively for DirectX 12**:
+
+| Feature | Legacy Spout / Syphon | DirectPort D3D12 |
+| :--- | :--- | :--- |
+| **API Target** | D3D9Ex / D3D11 DXGI 1.0 Handles | Native D3D12 / DXGI 1.6 NT Security Handles |
+| **Cross-Process Sync** | `Flush()` / CPU spinlocks (tears or stalls) | `ID3D12Fence` hardware crossbar wait (~170 ns) |
+| **CPU Overhead** | 5%–15% CPU burned in synchronization | **0.0% CPU** (handled entirely on GPU command processor) |
+| **Audio Conduit** | None (requires virtual audio cable / Dante) | **Synchronized A/V** (WASAPI float PCM ring buffer) |
+| **Kernel Namespace Thrash** | Constant polling on `OpenFileMapping` | Decoupled 3-second UDP beacon (loopback zero-firewall default) |
+| **Window & Backdrop** | Standard Win32 frame | Windows 11 Mica Alt (`DWMSBT_TABBEDWINDOW`) |
+
+---
+
+## 3. Unified Binary & System Tray Service (`DirectPort.exe`)
+
+The codebase compiles into a single, compact **499 KB unmanaged Windows AMD64 executable** (`DirectPort.exe`) featuring a linear execution graph and zero-flash mode switching.
+
+```text
+[Input Acquire]                 [Graph Composition]              [Present & Sync]
+  ├── HLSL Dynamic Compiler  ─┐   ├── Backbuffer Direct Copy ──┐   ├── ExecuteCommandLists
+  ├── Precompiled CSO Bytecode│   ├── Textured Quad Blit     │   ├── Signal Hardware Fence
+  ├── Live UVC Camera Stream ─┼──>├── 4-Way Multi-Tile Grid  ┼──>├── Flip-Discard Present
+  └── NT Crossbar Handle Wait │                                │   └── Waitable Swapchain Sync
+                              │                                │
+                       [WASAPI Loopback]               [WASAPI Render]
+```
+
+### Modes & Hotkeys
+
+Modes can be set via command-line flags or toggled dynamically in the running window:
+
+* **`F1` — Producer (HLSL Shader)**: Evaluates dynamic shaders (default `shaders/plasma.hlsl` or `shaders/smpte.hlsl`). Press **`F5`** for instant live hot-reload without restarting.
+* **`F2` — Producer (Live Camera)**: Captures physical UVC webcam streams at hardware resolution via Media Foundation (`IMFSourceReader`) directly into VRAM.
+* **`F3` — Consumer (Auto-Listen)**: Automatically discovers running producers, attaches to shared NT handles, and queues GPU hardware waits.
+* **`F4` — Multiplexer (4-Way Grid)**: Discovers multiple producers and composites them into a synchronized 2x2 multi-camera grid.
+* **`M` — Audio Toggle**: Mutes or unmutes the synchronized WASAPI loopback audio stream.
+* **`Esc` / `Q` — Exit**: Clean shutdown releasing all NT object handles.
+
+### Windows 11 System Tray & Acrylic Context Menu
+
+Imported directly from **VirtuaCam**, `DirectPort.exe` lives in the Windows notification area (system tray). Right-clicking the tray icon or the window client area opens a dark-mode Acrylic context menu with generational VOM handle safety, allowing instantaneous mode switching without command-line flags.
+
+---
+
+## 4. Discovery Protocol: Loopback vs. LAN
+
+To eliminate the kernel namespace polling thrash of legacy prototypes (which hammered `OpenFileMappingW` inside inner message loops), DirectPort uses a non-blocking UDP beacon (`port 3987`):
+
+* **Loopback Mode (Default)**: Binds to `127.0.0.1`. Windows Firewall **never** prompts or warns for loopback sockets. Local inter-process communication (between OBS, TouchDesigner, Unreal, Unity, and DirectPort) operates with zero user friction.
+* **LAN Broadcast (`--lan`)**: Emits to `255.255.255.255:3987` for cross-machine discovery on a local network.
+* **Cadence**: Broadcasts an initial announcement on frame 1, followed by a quiet 3-second heartbeat. Connected consumers execute zero network calls during active rendering.
+
+---
+
+## 5. Ecosystem Interop: OBS Studio & WebView2
+
+### OBS Studio Source Plugin (High Tractability)
+OBS Studio's graphics subsystem (`libobs-d3d11`) exposes `gs_texture_open_shared()` and `gs_texture_create_from_d3d11_texture()`. A native DirectPort OBS source plugin is ~150 lines of C:
+1. Producer writes D3D12 texture and signals shared NT fence.
+2. OBS plugin opens NT handle, queues `dp12_queue_wait()`, and blits the texture into the OBS canvas.
+3. Audio from the WASAPI shared ring buffer streams directly into `obs_source_output_audio()`.
+
+### WebView2 Consumer
+Chromium's sandboxing blocks arbitrary Win32 NT handle imports into WebGL/WebGPU. Two clean integration paths exist:
+1. **Media Foundation Virtual Camera (VirtuaCam)**: Route DirectPort frames into VirtuaCam's Media Foundation source. Any WebView2, Electron, or Chrome window consumes it at 60 FPS via standard HTML5 `<video>` / `navigator.mediaDevices.getUserMedia()`.
+2. **Native Host Injection**: A Win32 host application embedding WebView2 renders DirectPort in D3D12 and injects video via custom local WebRTC streams.
+
+---
+
+## 6. Repository Layout
 
 ```text
 DirectPort/
+├── dist/
+│   ├── DirectPort-v0.2.0-Core.zip   # Official release package
+│   └── SHA512SUMS.txt               # NIST SHA-512 verification ledger
 ├── docs/
-│   └── directport.png            # DirectPort hardware die & VRAM badge
+│   ├── directport.png               # Toilet-in-VRAM logo badge
+│   └── directport.ico               # Multi-resolution Win32 application icon
+├── shaders/
+│   ├── plasma.hlsl                  # Procedural dynamic test shader
+│   └── smpte.hlsl                   # SMPTE 75% broadcast color bars
 ├── src/
-│   ├── sdk/                      # Clean, minimal C-API transport layer
-│   │   ├── directport.h          # Public C API header & format definitions
-│   │   ├── directportd3d12.cpp   # D3D12 resource creation, fences, NT handle resolver
-│   │   └── directportd3d11.cpp   # D3D11 compatibility layer & texture sharing
-│   ├── sma/                      # DirectPortSMA: Native PowerShell / SMA engine
-│   │   ├── DirectPort.Canvas2D.Native.cpp  # Direct2D / DirectWrite canvas rendering
-│   │   ├── DirectPort.Console.Native.cpp   # High-throughput console presentation
-│   │   ├── DirectPort.PowerShell.cpp       # Native unmanaged SMA bridge
-│   │   ├── DirectPort.Shader.Native.cpp    # In-memory HLSL shader compilation
-│   │   └── SMA.cpp                         # Native SMA runspace hosting
-│   ├── ipc/                      # Windows Shell & Context Menu IPC
-│   │   ├── menudump.cpp          # Windows Explorer context menu interception
-│   │   ├── menudump.def          # Shell extension export definition
-│   │   ├── ipc.cpp               # Out-of-process menu graph transport
-│   │   └── shell-reg.ps1         # Shell extension registration script
-│   ├── presentation/             # DirectComposition & Shader Surfaces
-│   │   ├── DCompSurface/         # DirectComposition visual tree integration
-│   │   └── ShaderSurface/        # Standalone D3D12 shader surfaces (ps2orb)
-│   └── apps/                     # Native Applications
-│       └── RecordKit/            # Low-latency WASAPI float-PCM audio recorder
-└── legacy/                       # Historical prototypes
-    ├── DirectPort/               # Original 2025 C++ implementation
-    ├── Examples/                 # Native C++ examples
-    └── python/                   # Quarantined Python bindings & scripts
+│   ├── apps/
+│   │   └── DirectPort/              # Unified application binary
+│   │       ├── DirectPort.cpp       # Single-window linear DAG & message pump
+│   │       ├── DirectPort.rc        # Resource script with embedded icon
+│   │       ├── Menu.h               # VirtuaCam Acrylic context menu header
+│   │       └── Menu.cpp             # Generational VOM menu implementation
+│   ├── sdk/                         # Clean C/C++ transport layer
+│   │   ├── directport.h             # Core DirectPort C-ABI API
+│   │   ├── DirectPort_Discovery.h   # Non-blocking UDP beacon & listener
+│   │   ├── DirectPort_Audio.h       # WASAPI loopback capture & ring buffer
+│   │   ├── DirectPort_Camera.h      # Media Foundation UVC webcam capture
+│   │   ├── directportd3d12.cpp      # D3D12 NT handle & fence implementation
+│   │   └── directportd3d11.cpp      # D3D11 compatibility layer
+│   ├── sma/                         # DirectPortSMA: Native PowerShell / SMA engine
+│   ├── ipc/                         # Windows Shell & Context Menu IPC
+│   └── presentation/                # DirectComposition visual surfaces
+└── legacy/                          # Historical prototypes (quarantined)
+    ├── Examples/                    # Early polling-based prototypes
+    └── python/                      # Quarantined Python bindings & scripts
 ```
 
 ---
 
-## 3. The Core C-API (`src/sdk`)
+## 7. Release Verification (NIST SP 800-218)
 
-The production SDK layer provides a minimal, dependency-free C API for inter-process GPU memory sharing:
+| Package | SHA-512 Checksum | Description |
+| :--- | :--- | :--- |
+| **`DirectPort-v0.2.0-Core.zip`** | `8a6c28db715ad937435b3732045fbc2345e3d4c470d77ef58b6ff9dca27dd6585060693206dc7d372773f020429ca7cc5fd64dcb599825978be8df23421abca1` | Unified binary, headers, shaders, icon, and sources |
 
-```c
-#include "directport.h"
-
-// 1. Initialize subsystem (once per process)
-dp12_init();
-
-// 2. Producer: Create shared D3D12 resource with NT handle names
-DP_HANDLE port = dp12_create_shared_resource(
-    1920, 1080, DP_FORMAT_VIDEO, /*is_system_ram=*/false,
-    L"DirectPort_SharedTexture", L"DirectPort_SharedFence"
-);
-
-// 3. Signal completion on GPU command queue
-dp12_signal_fence(port, frame_counter++);
-
-// 4. Consumer: Open by NT name and queue asynchronous GPU hardware wait
-DP_HANDLE consumer = dp12_open_shared_resource(
-    L"DirectPort_SharedTexture", L"DirectPort_SharedFence"
-);
-dp12_queue_wait(consumer, pCommandQueue, completed_value);
-// GPU unblocks at ~170ns PCIe crossbar latency. Zero CPU intervention.
+Verify with PowerShell:
+```powershell
+Get-FileHash -Algorithm SHA512 .\dist\DirectPort-v0.2.0-Core.zip
 ```
-
----
-
-## 4. Lineage: Evolution into QuickPS
-
-The native PowerShell bindings in [`src/sma/`](src/sma/) and the WASAPI audio capture in [`src/apps/RecordKit/`](src/apps/RecordKit/) represent the key evolutionary bridge to **[QuickPS](https://github.com/MansfieldPlumbing/QuickPS)**:
-
-1. **Phase 1 (DirectPort C++)**: Proved GPU VRAM sharing via NT handles and DX12 fences.
-2. **Phase 2 (DirectPortSMA)**: Integrated D3D12, Direct2D, and WASAPI audio into PowerShell via unmanaged C++ DLL shims.
-3. **Phase 3 (QuickPS)**: Eliminated the C++ compilation step entirely by using `[Reflection.Emit]` to synthesize COM vtables and Win32 message pumps dynamically in-memory.
 
 ---
 
