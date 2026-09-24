@@ -1,6 +1,7 @@
 // --- DirectPort_Camera.h ---
 // High-performance Win32 Media Foundation Camera Capture for DirectPort.
 // Reads frames from active UVC webcam into contiguous BGRA/RGBA buffers with zero CPU thrash.
+// Supports device enumeration, multiple cameras, and zero-copy mapped staging upload.
 
 #pragma once
 
@@ -16,6 +17,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 
 #pragma comment(lib, "mf.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -24,10 +26,65 @@
 
 using Microsoft::WRL::ComPtr;
 
+struct CameraDeviceInfo {
+    int index = 0;
+    std::wstring friendlyName;
+    std::wstring symbolicLink;
+};
+
 class DirectPortCameraCapture {
 public:
-    DirectPortCameraCapture() : m_width(0), m_height(0), m_isCapturing(false), m_initializedMF(false) {}
+    DirectPortCameraCapture() 
+        : m_width(0), m_height(0), m_isCapturing(false), m_initializedMF(false), m_deviceIndex(0) {}
     ~DirectPortCameraCapture() { Shutdown(); }
+
+    static std::vector<CameraDeviceInfo> EnumerateCameras() {
+        std::vector<CameraDeviceInfo> result;
+        HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        bool needsUninit = (hrCom == S_OK);
+
+        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        if (FAILED(hr)) {
+            if (needsUninit) CoUninitialize();
+            return result;
+        }
+
+        ComPtr<IMFAttributes> pAttributes;
+        if (SUCCEEDED(MFCreateAttributes(&pAttributes, 1))) {
+            pAttributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+            UINT32 count = 0;
+            IMFActivate** ppDevices = nullptr;
+            if (SUCCEEDED(MFEnumDeviceSources(pAttributes.Get(), &ppDevices, &count)) && count > 0) {
+                for (UINT32 i = 0; i < count; ++i) {
+                    CameraDeviceInfo info = {};
+                    info.index = (int)i;
+                    WCHAR* pName = nullptr;
+                    UINT32 cchName = 0;
+                    if (SUCCEEDED(ppDevices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &pName, &cchName)) && pName) {
+                        info.friendlyName = pName;
+                        CoTaskMemFree(pName);
+                    } else {
+                        info.friendlyName = L"Camera " + std::to_wstring(i);
+                    }
+
+                    WCHAR* pLink = nullptr;
+                    UINT32 cchLink = 0;
+                    if (SUCCEEDED(ppDevices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &pLink, &cchLink)) && pLink) {
+                        info.symbolicLink = pLink;
+                        CoTaskMemFree(pLink);
+                    }
+
+                    result.push_back(info);
+                    ppDevices[i]->Release();
+                }
+                CoTaskMemFree(ppDevices);
+            }
+        }
+
+        MFShutdown();
+        if (needsUninit) CoUninitialize();
+        return result;
+    }
 
     bool Initialize(int deviceIndex = 0) {
         Shutdown();
@@ -47,6 +104,16 @@ public:
         }
 
         if (deviceIndex < 0 || (UINT32)deviceIndex >= count) deviceIndex = 0;
+        m_deviceIndex = deviceIndex;
+
+        WCHAR* pName = nullptr;
+        UINT32 cchName = 0;
+        if (SUCCEEDED(ppDevices[deviceIndex]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &pName, &cchName)) && pName) {
+            m_deviceName = pName;
+            CoTaskMemFree(pName);
+        } else {
+            m_deviceName = L"Camera " + std::to_wstring(deviceIndex);
+        }
 
         ComPtr<IMFMediaSource> pSource;
         hr = ppDevices[deviceIndex]->ActivateObject(IID_PPV_ARGS(&pSource));
@@ -69,16 +136,19 @@ public:
         outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
 
-        bool formatFound = false;
-        for (DWORD i = 0; ; ++i) {
-            ComPtr<IMFMediaType> nativeType;
-            if (m_sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType) == MF_E_NO_MORE_TYPES) {
-                break;
-            }
-            if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeType.Get()))) {
-                if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()))) {
-                    formatFound = true;
-                    break;
+        bool formatFound = SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()));
+
+        if (!formatFound) {
+            for (DWORD i = 0; ; ++i) {
+                ComPtr<IMFMediaType> nativeType;
+                hr = m_sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
+                if (hr == MF_E_NO_MORE_TYPES || FAILED(hr)) break;
+
+                if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeType.Get()))) {
+                    if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()))) {
+                        formatFound = true;
+                        break;
+                    }
                 }
             }
         }
@@ -89,15 +159,37 @@ public:
         if (FAILED(m_sourceReader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &currentType))) return false;
         UINT32 w = 0, h = 0;
         MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &w, &h);
-        m_width = w;
-        m_height = h;
+        m_width = (w > 0) ? w : 1280;
+        m_height = (h > 0) ? h : 720;
 
-        m_frameBuffer.resize(m_width * m_height * 4);
         m_isCapturing = true;
         return true;
     }
 
-    // Returns true if a new frame was successfully read into outBuffer
+    bool ReadFrame(BYTE* pDest, size_t destSize, DWORD* pBytesCopied = nullptr) {
+        if (!m_isCapturing || !m_sourceReader || !pDest) return false;
+
+        ComPtr<IMFSample> pSample;
+        DWORD streamFlags = 0;
+        LONGLONG timestamp = 0;
+        HRESULT hr = m_sourceReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &streamFlags, &timestamp, &pSample);
+        if (FAILED(hr) || !pSample) return false;
+
+        ComPtr<IMFMediaBuffer> pBuffer;
+        if (FAILED(pSample->ConvertToContiguousBuffer(&pBuffer))) return false;
+
+        BYTE* pData = nullptr;
+        DWORD currentLength = 0;
+        if (FAILED(pBuffer->Lock(&pData, nullptr, &currentLength))) return false;
+
+        DWORD toCopy = (std::min)((DWORD)destSize, currentLength);
+        memcpy(pDest, pData, toCopy);
+        if (pBytesCopied) *pBytesCopied = toCopy;
+        pBuffer->Unlock();
+
+        return true;
+    }
+
     bool ReadFrame(std::vector<BYTE>& outBuffer) {
         if (!m_isCapturing || !m_sourceReader) return false;
 
@@ -138,12 +230,15 @@ public:
     UINT GetWidth() const { return m_width; }
     UINT GetHeight() const { return m_height; }
     bool IsActive() const { return m_isCapturing; }
+    int GetDeviceIndex() const { return m_deviceIndex; }
+    const std::wstring& GetDeviceName() const { return m_deviceName; }
 
 private:
     ComPtr<IMFSourceReader> m_sourceReader;
     UINT m_width;
     UINT m_height;
-    std::vector<BYTE> m_frameBuffer;
+    int m_deviceIndex;
+    std::wstring m_deviceName;
     std::atomic<bool> m_isCapturing;
     bool m_initializedMF;
 };

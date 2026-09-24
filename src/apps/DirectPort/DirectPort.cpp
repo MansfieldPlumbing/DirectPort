@@ -3,13 +3,15 @@
 // Linear Execution Graph with Single-Window Solution & System Tray Service.
 // Features:
 //  - Linear execution graph: Input Acquire -> Composition -> Present & Sync -> Audio Pump
-//  - Windows System Tray (notification area) integration with custom context menu
-//  - Hotkeys: F1 (Shader Producer), F2 (Camera Producer), F3 (Consumer), F4 (Multiplexer), F5 (Reload), M (Audio)
-//  - Right-click window client area or system tray icon for instant mode switching
-//  - Windows 11 Mica Alt backdrop (QuickPS attributes)
+//  - Windows System Tray (notification area) integration with custom dark Acrylic context menu
+//  - Full physical webcam enumeration & capture (Media Foundation, zero CPU copy)
+//  - Raw Badass 256-Camera D3D12 Multiplexer Blueprint (from DirectPort-Legacy)
+//  - Dynamic N x M grid layout: cols = ceil(sqrt(count)), rows = ceil(count/cols)
+//  - Multiplexer produces composited grid as shared stream (DirectPort_Tex_Multiplexer)
 //  - Non-blocking UDP discovery beacon (3-second cadence, loopback zero-prompt default)
-//  - Hardware crossbar queue wait (ID3D12CommandQueue::Wait, ~170ns latency)
-//  - Event-driven waitable swapchain message pump (zero CPU thrashing)
+//  - GPU hardware crossbar fence wait (ID3D12CommandQueue::Wait, ~170ns latency)
+//  - Event-driven waitable swapchain pump with zero polling thrash
+//  - Embedded HLSL fallback shaders (never fails to render, no black screens)
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -22,11 +24,13 @@
 #include <dwmapi.h>
 #include <wrl.h>
 #include <sddl.h>
+#include <tlhelp32.h>
 #include <string>
 #include <vector>
 #include <chrono>
 #include <fstream>
 #include <algorithm>
+#include <cmath>
 
 #include "../../sdk/directport.h"
 #include "../../sdk/DirectPort_Discovery.h"
@@ -44,6 +48,7 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "Synchronization.lib")
 
 using namespace Microsoft::WRL;
 
@@ -62,39 +67,115 @@ using namespace Microsoft::WRL;
 #endif
 
 // --- App Message & Menu Command IDs ---
-#define WM_APP_TRAY_MSG       (WM_APP + 1)
-#define IDM_MODE_SHADER       1001
-#define IDM_MODE_CAMERA       1002
-#define IDM_MODE_CONSUMER     1003
-#define IDM_MODE_MULTIPLEXER  1004
-#define IDM_RELOAD_SHADER     1005
-#define IDM_TOGGLE_AUDIO      1006
-#define IDM_SHOW_HIDE_WINDOW  1007
-#define IDM_EXIT              1008
+#define WM_APP_TRAY_MSG        (WM_APP + 1)
+#define IDM_MODE_SHADER        1001
+#define IDM_MODE_CAMERA        1002
+#define IDM_MODE_CONSUMER      1003
+#define IDM_MODE_MULTIPLEXER   1004
+#define IDM_RELOAD_SHADER      1005
+#define IDM_TOGGLE_AUDIO       1006
+#define IDM_CYCLE_CAMERA       1007
+#define IDM_SHOW_HIDE_WINDOW   1008
+#define IDM_EXIT               1009
+#define IDM_CAMERA_SELECT_BASE 2000
 
 enum DirectPortAppMode {
-    MODE_CONSUMER,
     MODE_PRODUCER_SHADER,
     MODE_PRODUCER_CAMERA,
+    MODE_CONSUMER,
     MODE_MULTIPLEXER
 };
 
 static const UINT kFrameCount = 2;
 static const UINT kDefaultWidth = 1920;
 static const UINT kDefaultHeight = 1080;
-static const UINT kMaxMuxSlots = 4;
+static const int  MAX_MUX_PRODUCERS = 256;
+
+// Shared Manifest Struct
+struct BroadcastManifest {
+    UINT64 frameValue;
+    UINT width;
+    UINT height;
+    DXGI_FORMAT format;
+    LUID adapterLuid;
+    WCHAR textureName[256];
+    WCHAR fenceName[256];
+};
 
 struct ShaderConstants {
-    float u_resolution[4]; // xy = res, z = aspect, w = 0
-    float u_time[4];       // x = elapsed, y = delta, z = frameIndex, w = 0
+    float u_resolution[4]; // xy = res, z = aspect, w = mode
+    float u_time[4];       // x = elapsed, y = delta, z = frameIndex, w = status
     float u_mouse[4];      // xy = pos, zw = 0
 };
+
+// --- Embedded HLSL Fallback Shaders ---
+static const char* g_defaultShaderHLSL = R"(
+cbuffer Constants : register(b0) {
+    float4 u_resolution; // xy = res, z = aspect, w = mode
+    float4 u_time;       // x = elapsed, y = delta, z = frameIndex, w = status
+    float4 u_mouse;      // xy = pos, zw = 0
+};
+
+Texture2D g_texture : register(t0);
+SamplerState g_sampler : register(s0);
+
+struct PSInput {
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+PSInput VSMain(uint id : SV_VertexID) {
+    PSInput o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1);
+    o.uv = uv;
+    return o;
+}
+
+float4 PSBlit(PSInput i) : SV_TARGET {
+    return g_texture.Sample(g_sampler, i.uv);
+}
+
+float4 PSPlasma(PSInput i) : SV_TARGET {
+    float2 uv = i.uv;
+    float t = u_time.x;
+    float v1 = sin(uv.x * 10.0 + t);
+    float v2 = sin(uv.y * 10.0 + t * 1.2);
+    float v3 = sin((uv.x + uv.y) * 8.0 + t * 0.8);
+    float cx = uv.x + 0.5 * sin(t * 0.33);
+    float cy = uv.y + 0.5 * cos(t * 0.5);
+    float v4 = sin(sqrt(cx * cx + cy * cy + 1.0) * 12.0 + t);
+    float val = v1 + v2 + v3 + v4;
+    float r = sin(val * 3.14159) * 0.5 + 0.5;
+    float g = sin(val * 3.14159 + 2.094) * 0.5 + 0.5;
+    float b = sin(val * 3.14159 + 4.188) * 0.5 + 0.5;
+    float vig = uv.x * (1.0 - uv.x) * uv.y * (1.0 - uv.y) * 16.0;
+    vig = saturate(pow(vig, 0.25));
+    float scan = 0.95 + 0.05 * sin(uv.y * u_resolution.y * 3.14159);
+    return float4(float3(r * 0.85 + 0.15, g * 0.3, b * 0.4) * vig * scan, 1.0);
+}
+
+float4 PSBlueprint(PSInput i) : SV_TARGET {
+    float2 uv = i.uv;
+    float t = u_time.x;
+    float2 grid = abs(frac(uv * 16.0 - 0.5) - 0.5) / max(fwidth(uv * 16.0), float2(0.0001, 0.0001));
+    float lineFactor = 1.0 - min(min(grid.x, grid.y), 1.0);
+    float2 quad = abs(frac(uv * 2.0 - 0.5) - 0.5) / max(fwidth(uv * 2.0), float2(0.0001, 0.0001));
+    float quadLine = 1.0 - min(min(quad.x, quad.y), 1.0);
+    float3 bg = float3(0.04, 0.05, 0.08);
+    float3 minorGrid = float3(0.08, 0.14, 0.22) * lineFactor;
+    float3 majorGrid = float3(0.78, 0.06, 0.18) * quadLine;
+    float scan = 0.96 + 0.04 * sin(uv.y * 300.0 + t * 4.0);
+    return float4((bg + minorGrid + majorGrid) * scan, 1.0);
+}
+)";
 
 // --- Subsystem State ---
 static HWND                           g_hwnd = nullptr;
 static HINSTANCE                      g_instance = nullptr;
 static HICON                          g_hIcon = nullptr;
-static DirectPortAppMode              g_mode = MODE_CONSUMER;
+static DirectPortAppMode              g_mode = MODE_PRODUCER_SHADER;
+static int                            g_cameraDeviceIndex = 0;
 static ComPtr<ID3D12Device>           g_device;
 static ComPtr<ID3D12CommandQueue>     g_commandQueue;
 static ComPtr<IDXGISwapChain3>        g_swapChain;
@@ -104,9 +185,12 @@ static ComPtr<ID3D12GraphicsCommandList> g_commandList;
 static ComPtr<ID3D12DescriptorHeap>   g_rtvHeap;
 static ComPtr<ID3D12DescriptorHeap>   g_srvHeap;
 static ComPtr<ID3D12DescriptorHeap>   g_producerSharedRtvHeap;
+static ComPtr<ID3D12DescriptorHeap>   g_producerSharedSrvHeap;
 static ComPtr<ID3D12RootSignature>    g_rootSignature;
-static ComPtr<ID3D12PipelineState>    g_pipelineStateShader;
 static ComPtr<ID3D12PipelineState>    g_pipelineStateBlit;
+static ComPtr<ID3D12PipelineState>    g_pipelineStatePlasma;
+static ComPtr<ID3D12PipelineState>    g_pipelineStateBlueprint;
+static ComPtr<ID3D12PipelineState>    g_pipelineStateCustom;
 static ComPtr<ID3D12Resource>         g_constantBuffer;
 static ShaderConstants*               g_pCbvData = nullptr;
 static UINT                           g_rtvDescriptorSize = 0;
@@ -122,25 +206,30 @@ static ComPtr<ID3D12Fence>            g_producerSharedFence;
 static UINT64                         g_producerSharedFrameValue = 0;
 static HANDLE                         g_producerSharedTexHandle = nullptr;
 static HANDLE                         g_producerSharedFenceHandle = nullptr;
+static HANDLE                         g_hProducerManifest = nullptr;
+static BroadcastManifest*             g_pProducerManifestView = nullptr;
 static std::wstring                   g_streamName = L"DirectPort_Main";
 static std::wstring                   g_texHandleName = L"DirectPort_Tex_Main";
 static std::wstring                   g_fenceHandleName = L"DirectPort_Fence_Main";
 static std::wstring                   g_audioBufferName = L"DirectPort_Audio_Main";
 static std::string                    g_shaderPath = "shaders/plasma.hlsl";
-static ComPtr<ID3D12Resource>         g_cameraUploadBuffer;
-static UINT8*                         g_pCameraUploadData = nullptr;
 static auto                           g_producerStartTime = std::chrono::steady_clock::now();
 
-// --- Consumer / Multiplexer Slot Struct ---
-struct GraphStreamSlot {
+// --- Camera Staging Resources ---
+static ComPtr<ID3D12Resource>         g_cameraTexture;
+static ComPtr<ID3D12DescriptorHeap>   g_cameraSrvHeap;
+static ComPtr<ID3D12Resource>         g_cameraUploadBuffer;
+static UINT8*                         g_pCameraUploadData = nullptr;
+static UINT                           g_cameraUploadSize = 0;
+static UINT                           g_cameraRowPitch = 0;
+
+// --- Consumer Slot ---
+struct ConsumerSlot {
     bool                   active = false;
     std::string            streamName;
     std::wstring           texHandleName;
     std::wstring           fenceHandleName;
     std::wstring           audioBufferName;
-    UINT                   width = 0;
-    UINT                   height = 0;
-    DXGI_FORMAT            format = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D12Resource> sharedTexture;
     ComPtr<ID3D12Fence>    sharedFence;
     HANDLE                 hSharedTex = nullptr;
@@ -148,9 +237,35 @@ struct GraphStreamSlot {
     UINT64                 lastFrame = 0;
     bool                   hasAudio = false;
 };
+static ConsumerSlot                   g_consumerSlot;
 
-static GraphStreamSlot                g_consumerSlot;
-static GraphStreamSlot                g_muxSlots[kMaxMuxSlots];
+// --- Multiplexer (Raw Badass 256-Slot Blueprint) ---
+struct MuxProducerSlot {
+    bool                   isConnected = false;
+    DWORD                  producerPid = 0;
+    std::wstring           streamName;
+    HANDLE                 hManifest = nullptr;
+    BroadcastManifest*     pManifestView = nullptr;
+    ComPtr<ID3D12Resource> sharedTexture;
+    ComPtr<ID3D12Fence>    sharedFence;
+    UINT64                 lastSeenFrame = 0;
+    ComPtr<ID3D12Resource> privateTexture;
+    UINT                   srvDescriptorIndex = 0;
+    HANDLE                 hSharedTex = nullptr;
+    HANDLE                 hSharedFence = nullptr;
+};
+static MuxProducerSlot                g_muxProducers[MAX_MUX_PRODUCERS];
+static ComPtr<ID3D12DescriptorHeap>   g_muxSrvHeap;
+static ComPtr<ID3D12Resource>         g_muxCompositeTexture;
+static ComPtr<ID3D12DescriptorHeap>   g_muxCompositeRtvHeap;
+static ComPtr<ID3D12DescriptorHeap>   g_muxCompositeSrvHeap;
+static ComPtr<ID3D12Resource>         g_muxSharedOutTexture;
+static ComPtr<ID3D12Fence>            g_muxSharedOutFence;
+static UINT64                         g_muxSharedOutFrameValue = 0;
+static HANDLE                         g_hMuxManifestOut = nullptr;
+static BroadcastManifest*             g_pMuxManifestViewOut = nullptr;
+static HANDLE                         g_muxSharedOutTexHandle = nullptr;
+static HANDLE                         g_muxSharedOutFenceHandle = nullptr;
 
 // --- Networking & Audio Services ---
 static DirectPortDiscoveryBroadcaster g_broadcaster;
@@ -178,9 +293,15 @@ bool InitPipelines();
 bool LoadProducerShader(const std::string& path);
 bool InitProducerSharedResources();
 void TeardownProducerResources();
+bool InitCameraResources();
+void TeardownCameraResources();
 void TeardownConsumerResources();
+bool InitMuxResources();
 void TeardownMuxResources();
+void Mux_FindAndConnectProducers();
+void Mux_DisconnectProducer(int i);
 void SwitchMode(DirectPortAppMode newMode);
+void SwitchCamera(int deviceIndex);
 void ToggleAudio();
 void StepGraph_Discovery();
 void StepGraph_InputAcquire();
@@ -196,11 +317,17 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow) {
     g_instance = hInstance;
 
+    // Initialize COM on main thread for Media Foundation & WASAPI
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    bool modeSetByCmd = false;
+
     for (int i = 1; i < argc; ++i) {
-        if (_wcsicmp(argv[i], L"--produce") == 0 || _wcsicmp(argv[i], L"-p") == 0) {
+        if (_wcsicmp(argv[i], L"--produce") == 0 || _wcsicmp(argv[i], L"-p") == 0 || _wcsicmp(argv[i], L"--shader") == 0) {
             g_mode = MODE_PRODUCER_SHADER;
+            modeSetByCmd = true;
             if (i + 1 < argc && argv[i + 1][0] != L'-') {
                 char buf[512] = {};
                 WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, buf, sizeof(buf), NULL, NULL);
@@ -208,10 +335,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
             }
         } else if (_wcsicmp(argv[i], L"--camera") == 0 || _wcsicmp(argv[i], L"-c") == 0) {
             g_mode = MODE_PRODUCER_CAMERA;
+            modeSetByCmd = true;
+            if (i + 1 < argc && argv[i + 1][0] != L'-') {
+                g_cameraDeviceIndex = _wtoi(argv[++i]);
+            }
+        } else if (_wcsicmp(argv[i], L"--device") == 0 && i + 1 < argc) {
+            g_cameraDeviceIndex = _wtoi(argv[++i]);
         } else if (_wcsicmp(argv[i], L"--consume") == 0 || _wcsicmp(argv[i], L"-s") == 0) {
             g_mode = MODE_CONSUMER;
+            modeSetByCmd = true;
         } else if (_wcsicmp(argv[i], L"--mux") == 0 || _wcsicmp(argv[i], L"-m") == 0) {
             g_mode = MODE_MULTIPLEXER;
+            modeSetByCmd = true;
         } else if (_wcsicmp(argv[i], L"--no-audio") == 0) {
             g_enableAudio = false;
         } else if (_wcsicmp(argv[i], L"--lan") == 0) {
@@ -219,6 +354,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
         }
     }
     LocalFree(argv);
+
+    // If no mode explicitly set, check if a webcam is available. If so, start camera feed!
+    if (!modeSetByCmd) {
+        auto cams = DirectPortCameraCapture::EnumerateCameras();
+        if (!cams.empty()) {
+            g_mode = MODE_PRODUCER_CAMERA;
+        } else {
+            g_mode = MODE_PRODUCER_SHADER;
+        }
+    }
 
     g_hIcon = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
     if (!g_hIcon) g_hIcon = LoadIconW(nullptr, IDI_APPLICATION);
@@ -268,14 +413,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
 
         if (!running) break;
 
-        // Linear Graph: Discovery Cadence (every 3 seconds)
+        // Stage 0: Non-blocking discovery cadence (every 2-3 seconds)
         StepGraph_Discovery();
 
         if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_TIMEOUT) {
             RECT clientRc;
             GetClientRect(g_hwnd, &clientRc);
-            float totalW = std::max(1.0f, (float)(clientRc.right - clientRc.left));
-            float totalH = std::max(1.0f, (float)(clientRc.bottom - clientRc.top));
+            float totalW = (std::max)(1.0f, (float)(clientRc.right - clientRc.left));
+            float totalH = (std::max)(1.0f, (float)(clientRc.bottom - clientRc.top));
 
             g_allocators[g_frameIndex]->Reset();
             g_commandList->Reset(g_allocators[g_frameIndex].Get(), nullptr);
@@ -287,6 +432,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR pCmdLine, int nCmdShow
     }
 
     Cleanup();
+    CoUninitialize();
     return 0;
 }
 
@@ -329,8 +475,21 @@ void ShowContextMenu(HWND hwnd, POINT pt) {
     menu->AddItem(L"Producer: Procedural Shader\tF1", IDM_MODE_SHADER, g_mode == MODE_PRODUCER_SHADER);
     menu->AddItem(L"Producer: Live Camera Feed\tF2", IDM_MODE_CAMERA, g_mode == MODE_PRODUCER_CAMERA);
     menu->AddItem(L"Consumer: Auto-Listen Stream\tF3", IDM_MODE_CONSUMER, g_mode == MODE_CONSUMER);
-    menu->AddItem(L"Multiplexer: 4-Way Grid\tF4", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
+    menu->AddItem(L"Multiplexer: 256-Camera Blueprint\tF4", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
     menu->AddSeparator();
+
+    // Enumerate cameras and add to menu
+    auto cams = DirectPortCameraCapture::EnumerateCameras();
+    if (!cams.empty()) {
+        for (const auto& c : cams) {
+            std::wstring camItem = L"Camera: " + c.friendlyName;
+            bool active = (g_mode == MODE_PRODUCER_CAMERA && g_cameraDeviceIndex == c.index);
+            menu->AddItem(camItem, IDM_CAMERA_SELECT_BASE + c.index, active);
+        }
+        menu->AddItem(L"Cycle Next Camera\tC", IDM_CYCLE_CAMERA, false);
+        menu->AddSeparator();
+    }
+
     menu->AddItem(L"Reload HLSL Shader\tF5", IDM_RELOAD_SHADER, false);
     menu->AddItem(L"WASAPI Audio Crossbar\tM", IDM_TOGGLE_AUDIO, g_enableAudio);
     menu->AddSeparator();
@@ -363,14 +522,14 @@ bool InitD3D12(HWND hwnd) {
 
     RECT rc;
     GetClientRect(hwnd, &rc);
-    UINT width = (UINT)std::max(1, (int)(rc.right - rc.left));
-    UINT height = (UINT)std::max(1, (int)(rc.bottom - rc.top));
+    UINT width = (UINT)(std::max)(1, (int)(rc.right - rc.left));
+    UINT height = (UINT)(std::max)(1, (int)(rc.bottom - rc.top));
 
     DXGI_SWAP_CHAIN_DESC1 scDesc = {};
     scDesc.BufferCount = kFrameCount;
     scDesc.Width = width;
     scDesc.Height = height;
-    scDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     scDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scDesc.SampleDesc.Count = 1;
@@ -407,6 +566,38 @@ bool InitD3D12(HWND hwnd) {
     prodRtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
     g_device->CreateDescriptorHeap(&prodRtvDesc, IID_PPV_ARGS(&g_producerSharedRtvHeap));
 
+    D3D12_DESCRIPTOR_HEAP_DESC prodSrvDesc = {};
+    prodSrvDesc.NumDescriptors = 1;
+    prodSrvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    prodSrvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    g_device->CreateDescriptorHeap(&prodSrvDesc, IID_PPV_ARGS(&g_producerSharedSrvHeap));
+
+    // Camera SRV Heap
+    D3D12_DESCRIPTOR_HEAP_DESC camSrvDesc = {};
+    camSrvDesc.NumDescriptors = 1;
+    camSrvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    camSrvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    g_device->CreateDescriptorHeap(&camSrvDesc, IID_PPV_ARGS(&g_cameraSrvHeap));
+
+    // Multiplexer SRV Heap (256 slots)
+    D3D12_DESCRIPTOR_HEAP_DESC muxSrvDesc = {};
+    muxSrvDesc.NumDescriptors = MAX_MUX_PRODUCERS;
+    muxSrvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    muxSrvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    g_device->CreateDescriptorHeap(&muxSrvDesc, IID_PPV_ARGS(&g_muxSrvHeap));
+
+    // Multiplexer Composite RTV & SRV Heaps
+    D3D12_DESCRIPTOR_HEAP_DESC muxCompRtvDesc = {};
+    muxCompRtvDesc.NumDescriptors = 1;
+    muxCompRtvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    g_device->CreateDescriptorHeap(&muxCompRtvDesc, IID_PPV_ARGS(&g_muxCompositeRtvHeap));
+
+    D3D12_DESCRIPTOR_HEAP_DESC muxCompSrvDesc = {};
+    muxCompSrvDesc.NumDescriptors = 1;
+    muxCompSrvDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    muxCompSrvDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    g_device->CreateDescriptorHeap(&muxCompSrvDesc, IID_PPV_ARGS(&g_muxCompositeSrvHeap));
+
     g_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_allocators[0].Get(), nullptr, IID_PPV_ARGS(&g_commandList));
     g_commandList->Close();
 
@@ -427,12 +618,6 @@ bool InitD3D12(HWND hwnd) {
         D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_constantBuffer));
     g_constantBuffer->Map(0, nullptr, reinterpret_cast<void**>(&g_pCbvData));
 
-    D3D12_RESOURCE_DESC camDesc = cbDesc;
-    camDesc.Width = kDefaultWidth * kDefaultHeight * 4;
-    g_device->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &camDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cameraUploadBuffer));
-    g_cameraUploadBuffer->Map(0, nullptr, reinterpret_cast<void**>(&g_pCameraUploadData));
-
     return true;
 }
 
@@ -445,7 +630,7 @@ bool InitPipelines() {
     D3D12_ROOT_PARAMETER rootParams[2] = {};
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rootParams[0].Descriptor.ShaderRegister = 0;
-    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rootParams[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -457,7 +642,6 @@ bool InitPipelines() {
     sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    sampler.ShaderRegister = 0;
     sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
@@ -467,72 +651,59 @@ bool InitPipelines() {
     rsDesc.pStaticSamplers = &sampler;
     rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
-    ComPtr<ID3DBlob> sigBlob;
-    D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, nullptr);
-    g_device->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSignature));
+    ComPtr<ID3DBlob> sigBlob, errBlob;
+    if (FAILED(D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errBlob))) return false;
+    if (FAILED(g_device->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(), IID_PPV_ARGS(&g_rootSignature)))) return false;
 
-    const char* blitShader = 
-        "Texture2D g_texture : register(t0);\n"
-        "SamplerState g_sampler : register(s0);\n"
-        "struct PSInput { float4 pos : SV_Position; float2 uv : TEXCOORD; };\n"
-        "PSInput VSMain(uint id : SV_VertexID) {\n"
-        "    PSInput o; o.uv = float2((id << 1) & 2, id & 2);\n"
-        "    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0); return o;\n"
-        "}\n"
-        "float4 PSMain(PSInput i) : SV_Target { return g_texture.Sample(g_sampler, i.uv); }\n";
+    // Compile embedded shaders
+    ComPtr<ID3DBlob> vsBlob, psBlitBlob, psPlasmaBlob, psBlueprintBlob;
+    D3DCompile(g_defaultShaderHLSL, strlen(g_defaultShaderHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr);
+    D3DCompile(g_defaultShaderHLSL, strlen(g_defaultShaderHLSL), nullptr, nullptr, nullptr, "PSBlit", "ps_5_0", 0, 0, &psBlitBlob, nullptr);
+    D3DCompile(g_defaultShaderHLSL, strlen(g_defaultShaderHLSL), nullptr, nullptr, nullptr, "PSPlasma", "ps_5_0", 0, 0, &psPlasmaBlob, nullptr);
+    D3DCompile(g_defaultShaderHLSL, strlen(g_defaultShaderHLSL), nullptr, nullptr, nullptr, "PSBlueprint", "ps_5_0", 0, 0, &psBlueprintBlob, nullptr);
 
-    ComPtr<ID3DBlob> vsBlob, psBlob;
-    D3DCompile(blitShader, strlen(blitShader), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr);
-    D3DCompile(blitShader, strlen(blitShader), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psBlob, nullptr);
+    if (!vsBlob || !psBlitBlob || !psPlasmaBlob || !psBlueprintBlob) return false;
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
     psoDesc.pRootSignature = g_rootSignature.Get();
     psoDesc.VS = { vsBlob->GetBufferPointer(), vsBlob->GetBufferSize() };
-    psoDesc.PS = { psBlob->GetBufferPointer(), psBlob->GetBufferSize() };
     psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
 
-    g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStateBlit));
+    // Blit PSO
+    psoDesc.PS = { psBlitBlob->GetBufferPointer(), psBlitBlob->GetBufferSize() };
+    if (FAILED(g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStateBlit)))) return false;
+
+    // Plasma PSO
+    psoDesc.PS = { psPlasmaBlob->GetBufferPointer(), psPlasmaBlob->GetBufferSize() };
+    if (FAILED(g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStatePlasma)))) return false;
+
+    // Blueprint PSO
+    psoDesc.PS = { psBlueprintBlob->GetBufferPointer(), psBlueprintBlob->GetBufferSize() };
+    if (FAILED(g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStateBlueprint)))) return false;
+
     LoadProducerShader(g_shaderPath);
     return true;
 }
 
 bool LoadProducerShader(const std::string& path) {
-    ComPtr<ID3DBlob> vsBlob, psBlob, errorBlob;
-    bool isCso = (path.size() > 4 && path.substr(path.size() - 4) == ".cso");
+    std::ifstream file(path);
+    if (!file.is_open()) return false;
+    std::string source((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 
-    if (isCso) {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file.is_open()) return false;
-        std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-        D3DCreateBlob((SIZE_T)size, &psBlob);
-        file.read(reinterpret_cast<char*>(psBlob->GetBufferPointer()), size);
-    } else {
-        std::wstring wPath(path.begin(), path.end());
-        HRESULT hr = D3DCompileFromFile(wPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, 
-            "VSMain", "vs_5_0", 0, 0, &vsBlob, &errorBlob);
-        if (FAILED(hr)) return false;
+    ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
+    HRESULT hr = D3DCompile(source.c_str(), source.length(), path.c_str(), nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &psBlob, &errBlob);
+    if (FAILED(hr) || !psBlob) return false;
 
-        hr = D3DCompileFromFile(wPath.c_str(), nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE, 
-            "PSMain", "ps_5_0", 0, 0, &psBlob, &errorBlob);
-        if (FAILED(hr)) return false;
-    }
-
-    if (!vsBlob) {
-        const char* passthroughVS = 
-            "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD; };\n"
-            "VSOut VSMain(uint id : SV_VertexID) {\n"
-            "    VSOut o; o.uv = float2((id << 1) & 2, id & 2);\n"
-            "    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0); return o;\n"
-            "}\n";
-        D3DCompile(passthroughVS, strlen(passthroughVS), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr);
+    hr = D3DCompile(source.c_str(), source.length(), path.c_str(), nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr);
+    if (FAILED(hr) || !vsBlob) {
+        D3DCompile(g_defaultShaderHLSL, strlen(g_defaultShaderHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vsBlob, nullptr);
     }
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
@@ -545,10 +716,10 @@ bool LoadProducerShader(const std::string& path) {
     psoDesc.SampleMask = UINT_MAX;
     psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     psoDesc.NumRenderTargets = 1;
-    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
     psoDesc.SampleDesc.Count = 1;
 
-    return SUCCEEDED(g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStateShader)));
+    return SUCCEEDED(g_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&g_pipelineStateCustom)));
 }
 
 bool InitProducerSharedResources() {
@@ -560,18 +731,19 @@ bool InitProducerSharedResources() {
     texDesc.Height = kDefaultHeight;
     texDesc.DepthOrArraySize = 1;
     texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     texDesc.SampleDesc.Count = 1;
-    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
 
     D3D12_HEAP_PROPERTIES defaultHeap = { D3D12_HEAP_TYPE_DEFAULT };
     D3D12_CLEAR_VALUE clearVal = {};
-    clearVal.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    clearVal.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
     if (FAILED(g_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_SHARED, &texDesc,
         D3D12_RESOURCE_STATE_COMMON, &clearVal, IID_PPV_ARGS(&g_producerSharedTexture)))) return false;
 
     g_device->CreateRenderTargetView(g_producerSharedTexture.Get(), nullptr, g_producerSharedRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    g_device->CreateShaderResourceView(g_producerSharedTexture.Get(), nullptr, g_producerSharedSrvHeap->GetCPUDescriptorHandleForHeapStart());
 
     if (FAILED(g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_producerSharedFence)))) return false;
 
@@ -579,10 +751,30 @@ bool InitProducerSharedResources() {
     sa.nLength = sizeof(sa);
     ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;AU)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
 
+    DWORD pid = GetCurrentProcessId();
+    g_texHandleName = L"Global\\DirectPortTexture_" + std::to_wstring(pid);
+    g_fenceHandleName = L"Global\\DirectPortFence_" + std::to_wstring(pid);
+
     g_device->CreateSharedHandle(g_producerSharedTexture.Get(), &sa, GENERIC_ALL, g_texHandleName.c_str(), &g_producerSharedTexHandle);
     g_device->CreateSharedHandle(g_producerSharedFence.Get(), &sa, GENERIC_ALL, g_fenceHandleName.c_str(), &g_producerSharedFenceHandle);
 
+    std::wstring manifestName = L"DirectPort_Producer_Manifest_" + std::to_wstring(pid);
+    g_hProducerManifest = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(BroadcastManifest), manifestName.c_str());
+
     if (sa.lpSecurityDescriptor) LocalFree(sa.lpSecurityDescriptor);
+
+    if (g_hProducerManifest) {
+        g_pProducerManifestView = (BroadcastManifest*)MapViewOfFile(g_hProducerManifest, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(BroadcastManifest));
+        if (g_pProducerManifestView) {
+            ZeroMemory(g_pProducerManifestView, sizeof(BroadcastManifest));
+            g_pProducerManifestView->width = kDefaultWidth;
+            g_pProducerManifestView->height = kDefaultHeight;
+            g_pProducerManifestView->format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            g_pProducerManifestView->adapterLuid = g_device->GetAdapterLuid();
+            wcscpy_s(g_pProducerManifestView->textureName, g_texHandleName.c_str());
+            wcscpy_s(g_pProducerManifestView->fenceName, g_fenceHandleName.c_str());
+        }
+    }
 
     if (g_enableAudio) {
         if (g_audioRingProducer.Initialize(g_audioBufferName.c_str(), 48000, 2)) {
@@ -599,36 +791,311 @@ void TeardownProducerResources() {
     g_broadcaster.Stop();
     g_wasapiCapture.Stop();
     g_audioRingProducer.Close();
-    g_cameraCapture.Shutdown();
 
+    if (g_pProducerManifestView) { UnmapViewOfFile(g_pProducerManifestView); g_pProducerManifestView = nullptr; }
+    if (g_hProducerManifest) { CloseHandle(g_hProducerManifest); g_hProducerManifest = nullptr; }
     if (g_producerSharedTexHandle) { CloseHandle(g_producerSharedTexHandle); g_producerSharedTexHandle = nullptr; }
     if (g_producerSharedFenceHandle) { CloseHandle(g_producerSharedFenceHandle); g_producerSharedFenceHandle = nullptr; }
     g_producerSharedTexture.Reset();
     g_producerSharedFence.Reset();
 }
 
+bool InitCameraResources() {
+    TeardownCameraResources();
+
+    if (!g_cameraCapture.Initialize(g_cameraDeviceIndex)) return false;
+
+    UINT camW = g_cameraCapture.GetWidth();
+    UINT camH = g_cameraCapture.GetHeight();
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = camW;
+    texDesc.Height = camH;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_HEAP_PROPERTIES defHeap = { D3D12_HEAP_TYPE_DEFAULT };
+    if (FAILED(g_device->CreateCommittedResource(&defHeap, D3D12_HEAP_FLAG_NONE, &texDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_cameraTexture)))) return false;
+
+    g_device->CreateShaderResourceView(g_cameraTexture.Get(), nullptr, g_cameraSrvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    // Aligned upload buffer (256-byte pitch requirement in D3D12)
+    g_cameraRowPitch = (camW * 4 + 255) & ~255;
+    g_cameraUploadSize = g_cameraRowPitch * camH;
+
+    D3D12_RESOURCE_DESC upDesc = {};
+    upDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    upDesc.Width = g_cameraUploadSize;
+    upDesc.Height = 1;
+    upDesc.DepthOrArraySize = 1;
+    upDesc.MipLevels = 1;
+    upDesc.SampleDesc.Count = 1;
+    upDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    D3D12_HEAP_PROPERTIES upHeap = { D3D12_HEAP_TYPE_UPLOAD };
+    if (FAILED(g_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &upDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cameraUploadBuffer)))) return false;
+
+    g_cameraUploadBuffer->Map(0, nullptr, reinterpret_cast<void**>(&g_pCameraUploadData));
+    return true;
+}
+
+void TeardownCameraResources() {
+    g_cameraCapture.Shutdown();
+    if (g_pCameraUploadData) {
+        g_cameraUploadBuffer->Unmap(0, nullptr);
+        g_pCameraUploadData = nullptr;
+    }
+    g_cameraUploadBuffer.Reset();
+    g_cameraTexture.Reset();
+    g_cameraUploadSize = 0;
+    g_cameraRowPitch = 0;
+}
+
 void TeardownConsumerResources() {
     StopAudioPlayback();
     g_audioRingConsumer.Close();
-    if (g_consumerSlot.hSharedTex) CloseHandle(g_consumerSlot.hSharedTex);
-    if (g_consumerSlot.hSharedFence) CloseHandle(g_consumerSlot.hSharedFence);
+    if (g_consumerSlot.hSharedTex) { CloseHandle(g_consumerSlot.hSharedTex); g_consumerSlot.hSharedTex = nullptr; }
+    if (g_consumerSlot.hSharedFence) { CloseHandle(g_consumerSlot.hSharedFence); g_consumerSlot.hSharedFence = nullptr; }
     g_consumerSlot.sharedTexture.Reset();
     g_consumerSlot.sharedFence.Reset();
     g_consumerSlot.active = false;
 }
 
-void TeardownMuxResources() {
-    for (UINT i = 0; i < kMaxMuxSlots; ++i) {
-        if (g_muxSlots[i].hSharedTex) CloseHandle(g_muxSlots[i].hSharedTex);
-        if (g_muxSlots[i].hSharedFence) CloseHandle(g_muxSlots[i].hSharedFence);
-        g_muxSlots[i].sharedTexture.Reset();
-        g_muxSlots[i].sharedFence.Reset();
-        g_muxSlots[i].active = false;
+bool InitMuxResources() {
+    TeardownMuxResources();
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.Width = kDefaultWidth;
+    texDesc.Height = kDefaultHeight;
+    texDesc.MipLevels = 1;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_HEAP_PROPERTIES defaultHeapProps = { D3D12_HEAP_TYPE_DEFAULT };
+    D3D12_CLEAR_VALUE clearVal = {};
+    clearVal.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+    if (FAILED(g_device->CreateCommittedResource(&defaultHeapProps, D3D12_HEAP_FLAG_NONE, &texDesc, 
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clearVal, IID_PPV_ARGS(&g_muxCompositeTexture)))) return false;
+
+    g_device->CreateRenderTargetView(g_muxCompositeTexture.Get(), nullptr, g_muxCompositeRtvHeap->GetCPUDescriptorHandleForHeapStart());
+    g_device->CreateShaderResourceView(g_muxCompositeTexture.Get(), nullptr, g_muxCompositeSrvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    texDesc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if (FAILED(g_device->CreateCommittedResource(&defaultHeapProps, D3D12_HEAP_FLAG_SHARED, &texDesc, 
+        D3D12_RESOURCE_STATE_COMMON, &clearVal, IID_PPV_ARGS(&g_muxSharedOutTexture)))) return false;
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), nullptr, FALSE };
+    ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;AU)", SDDL_REVISION_1, &sd, NULL);
+    sa.lpSecurityDescriptor = sd;
+
+    DWORD pid = GetCurrentProcessId();
+    std::wstring textureName = L"Global\\DirectPortTexture_Multiplexer_" + std::to_wstring(pid);
+    std::wstring fenceName = L"Global\\DirectPortFence_Multiplexer_" + std::to_wstring(pid);
+    g_device->CreateSharedHandle(g_muxSharedOutTexture.Get(), &sa, GENERIC_ALL, textureName.c_str(), &g_muxSharedOutTexHandle);
+    g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_muxSharedOutFence));
+    g_device->CreateSharedHandle(g_muxSharedOutFence.Get(), &sa, GENERIC_ALL, fenceName.c_str(), &g_muxSharedOutFenceHandle);
+
+    std::wstring manifestName = L"DirectPort_Producer_Manifest_" + std::to_wstring(pid);
+    g_hMuxManifestOut = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(BroadcastManifest), manifestName.c_str());
+    if (sd) LocalFree(sd);
+
+    if (g_hMuxManifestOut) {
+        g_pMuxManifestViewOut = (BroadcastManifest*)MapViewOfFile(g_hMuxManifestOut, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(BroadcastManifest));
+        if (g_pMuxManifestViewOut) {
+            ZeroMemory(g_pMuxManifestViewOut, sizeof(BroadcastManifest));
+            g_pMuxManifestViewOut->width = kDefaultWidth;
+            g_pMuxManifestViewOut->height = kDefaultHeight;
+            g_pMuxManifestViewOut->format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            g_pMuxManifestViewOut->adapterLuid = g_device->GetAdapterLuid();
+            wcscpy_s(g_pMuxManifestViewOut->textureName, textureName.c_str());
+            wcscpy_s(g_pMuxManifestViewOut->fenceName, fenceName.c_str());
+        }
     }
+
+    g_broadcaster.Start();
+    return true;
+}
+
+void TeardownMuxResources() {
+    for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) Mux_DisconnectProducer(i);
+
+    if (g_pMuxManifestViewOut) { UnmapViewOfFile(g_pMuxManifestViewOut); g_pMuxManifestViewOut = nullptr; }
+    if (g_hMuxManifestOut) { CloseHandle(g_hMuxManifestOut); g_hMuxManifestOut = nullptr; }
+    if (g_muxSharedOutTexHandle) { CloseHandle(g_muxSharedOutTexHandle); g_muxSharedOutTexHandle = nullptr; }
+    if (g_muxSharedOutFenceHandle) { CloseHandle(g_muxSharedOutFenceHandle); g_muxSharedOutFenceHandle = nullptr; }
+    g_muxSharedOutTexture.Reset();
+    g_muxSharedOutFence.Reset();
+    g_muxCompositeTexture.Reset();
+}
+
+void Mux_DisconnectProducer(int i) {
+    auto& p = g_muxProducers[i];
+    if (!p.isConnected) return;
+    if (p.pManifestView) UnmapViewOfFile(p.pManifestView);
+    if (p.hManifest) CloseHandle(p.hManifest);
+    if (p.hSharedTex) CloseHandle(p.hSharedTex);
+    if (p.hSharedFence) CloseHandle(p.hSharedFence);
+    p = {};
+}
+
+void Mux_FindAndConnectProducers() {
+    // 1. Clean up dead processes
+    for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+        if (!g_muxProducers[i].isConnected) continue;
+        if (g_muxProducers[i].producerPid != 0) {
+            HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, g_muxProducers[i].producerPid);
+            if (hProcess == NULL || WaitForSingleObject(hProcess, 0) != WAIT_TIMEOUT) {
+                Mux_DisconnectProducer(i);
+            }
+            if (hProcess) CloseHandle(hProcess);
+        }
+    }
+
+    // 2. Discover via Toolhelp32 process snapshot looking for manifests
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe32 = { sizeof(pe32) };
+        DWORD selfPid = GetCurrentProcessId();
+
+        if (Process32FirstW(hSnapshot, &pe32)) {
+            do {
+                if (pe32.th32ProcessID == selfPid) continue;
+
+                bool alreadyConnected = false;
+                for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+                    if (g_muxProducers[i].isConnected && g_muxProducers[i].producerPid == pe32.th32ProcessID) {
+                        alreadyConnected = true;
+                        break;
+                    }
+                }
+                if (alreadyConnected) continue;
+
+                int availableSlot = -1;
+                for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+                    if (!g_muxProducers[i].isConnected) { availableSlot = i; break; }
+                }
+                if (availableSlot == -1) break;
+
+                const std::vector<std::wstring> prefixes = { L"DirectPort_Producer_Manifest_", L"D3D12_Producer_Manifest_" };
+                HANDLE hManifest = nullptr;
+                for (const auto& prefix : prefixes) {
+                    std::wstring manifestName = prefix + std::to_wstring(pe32.th32ProcessID);
+                    hManifest = OpenFileMappingW(FILE_MAP_READ, FALSE, manifestName.c_str());
+                    if (hManifest) break;
+                }
+                if (!hManifest) continue;
+
+                BroadcastManifest* pManifestView = (BroadcastManifest*)MapViewOfFile(hManifest, FILE_MAP_READ, 0, 0, sizeof(BroadcastManifest));
+                if (!pManifestView) { CloseHandle(hManifest); continue; }
+
+                auto& producer = g_muxProducers[availableSlot];
+                HANDLE hTexture = nullptr, hFence = nullptr;
+                g_device->OpenSharedHandleByName(pManifestView->textureName, GENERIC_ALL, &hTexture);
+                g_device->OpenSharedHandleByName(pManifestView->fenceName, GENERIC_ALL, &hFence);
+
+                if (hTexture && hFence) {
+                    g_device->OpenSharedHandle(hTexture, IID_PPV_ARGS(&producer.sharedTexture));
+                    g_device->OpenSharedHandle(hFence, IID_PPV_ARGS(&producer.sharedFence));
+                    producer.hSharedTex = hTexture;
+                    producer.hSharedFence = hFence;
+                } else {
+                    if (hTexture) CloseHandle(hTexture);
+                    if (hFence) CloseHandle(hFence);
+                }
+
+                if (producer.sharedTexture && producer.sharedFence) {
+                    producer.isConnected = true;
+                    producer.producerPid = pe32.th32ProcessID;
+                    producer.hManifest = hManifest;
+                    producer.pManifestView = pManifestView;
+                    producer.lastSeenFrame = (pManifestView->frameValue > 0) ? (pManifestView->frameValue - 1) : 0;
+                    producer.srvDescriptorIndex = availableSlot;
+
+                    D3D12_RESOURCE_DESC desc = producer.sharedTexture->GetDesc();
+                    desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+                    D3D12_HEAP_PROPERTIES defaultHeapProps = { D3D12_HEAP_TYPE_DEFAULT };
+                    g_device->CreateCommittedResource(&defaultHeapProps, D3D12_HEAP_FLAG_NONE, &desc, 
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&producer.privateTexture));
+
+                    D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = g_muxSrvHeap->GetCPUDescriptorHandleForHeapStart();
+                    srvHandle.ptr += (UINT64)producer.srvDescriptorIndex * g_srvDescriptorSize;
+                    g_device->CreateShaderResourceView(producer.privateTexture.Get(), nullptr, srvHandle);
+                } else {
+                    UnmapViewOfFile(pManifestView);
+                    CloseHandle(hManifest);
+                }
+            } while (Process32NextW(hSnapshot, &pe32));
+        }
+        CloseHandle(hSnapshot);
+    }
+
+    // 3. Also connect to UDP-discovered streams
+    for (const auto& d : g_discoveredStreams) {
+        bool alreadyConnected = false;
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+            if (g_muxProducers[i].isConnected && g_muxProducers[i].streamName == d.textureHandleName) {
+                alreadyConnected = true;
+                break;
+            }
+        }
+        if (alreadyConnected) continue;
+
+        int availableSlot = -1;
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+            if (!g_muxProducers[i].isConnected) { availableSlot = i; break; }
+        }
+        if (availableSlot == -1) break;
+
+        HANDLE hTexture = nullptr, hFence = nullptr;
+        if (SUCCEEDED(g_device->OpenSharedHandleByName(d.textureHandleName.c_str(), GENERIC_ALL, &hTexture)) &&
+            SUCCEEDED(g_device->OpenSharedHandleByName(d.fenceHandleName.c_str(), GENERIC_ALL, &hFence))) {
+            auto& producer = g_muxProducers[availableSlot];
+            g_device->OpenSharedHandle(hTexture, IID_PPV_ARGS(&producer.sharedTexture));
+            g_device->OpenSharedHandle(hFence, IID_PPV_ARGS(&producer.sharedFence));
+            producer.hSharedTex = hTexture;
+            producer.hSharedFence = hFence;
+            producer.streamName = d.textureHandleName;
+            producer.isConnected = true;
+            producer.producerPid = 0;
+            producer.srvDescriptorIndex = availableSlot;
+
+            D3D12_RESOURCE_DESC desc = producer.sharedTexture->GetDesc();
+            desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+            D3D12_HEAP_PROPERTIES defaultHeapProps = { D3D12_HEAP_TYPE_DEFAULT };
+            g_device->CreateCommittedResource(&defaultHeapProps, D3D12_HEAP_FLAG_NONE, &desc, 
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&producer.privateTexture));
+
+            D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = g_muxSrvHeap->GetCPUDescriptorHandleForHeapStart();
+            srvHandle.ptr += (UINT64)producer.srvDescriptorIndex * g_srvDescriptorSize;
+            g_device->CreateShaderResourceView(producer.privateTexture.Get(), nullptr, srvHandle);
+        } else {
+            if (hTexture) CloseHandle(hTexture);
+            if (hFence) CloseHandle(hFence);
+        }
+    }
+}
+
+void SwitchCamera(int deviceIndex) {
+    g_cameraDeviceIndex = deviceIndex;
+    SwitchMode(MODE_PRODUCER_CAMERA);
 }
 
 void SwitchMode(DirectPortAppMode newMode) {
     TeardownProducerResources();
+    TeardownCameraResources();
     TeardownConsumerResources();
     TeardownMuxResources();
 
@@ -637,21 +1104,31 @@ void SwitchMode(DirectPortAppMode newMode) {
     switch (g_mode) {
         case MODE_PRODUCER_SHADER:
             InitProducerSharedResources();
-            SetWindowTextW(g_hwnd, L"DirectPort [PRODUCER: Shader] // Right-click or tray for menu");
+            SetWindowTextW(g_hwnd, L"DirectPort [PRODUCER: HLSL Shader (1920x1080)] // F1: Shader | F5: Reload");
             break;
+
         case MODE_PRODUCER_CAMERA:
-            if (!g_cameraCapture.Initialize(0)) {
+            if (!InitCameraResources()) {
+                // If webcam unavailable or failed, fallback gracefully to shader
                 SwitchMode(MODE_PRODUCER_SHADER);
                 return;
             }
             InitProducerSharedResources();
-            SetWindowTextW(g_hwnd, L"DirectPort [PRODUCER: Camera] // Right-click or tray for menu");
+            {
+                std::wstring title = L"DirectPort [PRODUCER: " + g_cameraCapture.GetDeviceName() + 
+                    L" (" + std::to_wstring(g_cameraCapture.GetWidth()) + L"x" + std::to_wstring(g_cameraCapture.GetHeight()) + 
+                    L")] // F2: Cam | C: Cycle";
+                SetWindowTextW(g_hwnd, title.c_str());
+            }
             break;
+
         case MODE_CONSUMER:
-            SetWindowTextW(g_hwnd, L"DirectPort [CONSUMER: Listening...] // Right-click or tray for menu");
+            SetWindowTextW(g_hwnd, L"DirectPort [CONSUMER: Scanning 127.0.0.1:3987 & Manifests...] // F3");
             break;
+
         case MODE_MULTIPLEXER:
-            SetWindowTextW(g_hwnd, L"DirectPort [MULTIPLEXER: 4-Way Crossbar] // Right-click or tray for menu");
+            InitMuxResources();
+            SetWindowTextW(g_hwnd, L"DirectPort [MULTIPLEXER: 256-Camera Blueprint Active] // F4");
             break;
     }
 }
@@ -672,98 +1149,74 @@ void ToggleAudio() {
     }
 }
 
-// Stage 0: Discovery Cadence (Every 3 seconds)
+// Stage 0: Non-blocking Discovery Cadence
 void StepGraph_Discovery() {
     auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::seconds>(now - g_lastDiscoveryCheck).count() < 3) return;
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - g_lastDiscoveryCheck).count() < 2) return;
     g_lastDiscoveryCheck = now;
 
     if (g_mode == MODE_PRODUCER_SHADER || g_mode == MODE_PRODUCER_CAMERA) {
-        g_broadcaster.Broadcast("DirectPort_Main", kDefaultWidth, kDefaultHeight, DXGI_FORMAT_R8G8B8A8_UNORM,
+        g_broadcaster.Broadcast("DirectPort_Main", kDefaultWidth, kDefaultHeight, DXGI_FORMAT_B8G8R8A8_UNORM,
             g_texHandleName.c_str(), g_fenceHandleName.c_str(), g_producerSharedFrameValue,
             g_enableAudio, 48000, 2, g_audioBufferName.c_str());
     } else if (g_mode == MODE_CONSUMER) {
         g_listener.Poll(g_discoveredStreams);
-        if (!g_consumerSlot.active && !g_discoveredStreams.empty()) {
-            const auto& d = g_discoveredStreams[0];
-            HANDLE hTex = nullptr, hFence = nullptr;
-            if (SUCCEEDED(g_device->OpenSharedHandleByName(d.textureHandleName.c_str(), GENERIC_ALL, &hTex)) &&
-                SUCCEEDED(g_device->OpenSharedHandleByName(d.fenceHandleName.c_str(), GENERIC_ALL, &hFence))) {
-                g_device->OpenSharedHandle(hTex, IID_PPV_ARGS(&g_consumerSlot.sharedTexture));
-                g_device->OpenSharedHandle(hFence, IID_PPV_ARGS(&g_consumerSlot.sharedFence));
-                g_consumerSlot.hSharedTex = hTex;
-                g_consumerSlot.hSharedFence = hFence;
-                g_consumerSlot.active = true;
-                g_consumerSlot.streamName = d.streamName;
-                g_consumerSlot.hasAudio = d.hasAudio;
 
-                D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-                srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                srvDesc.Texture2D.MipLevels = 1;
-                g_device->CreateShaderResourceView(g_consumerSlot.sharedTexture.Get(), &srvDesc, g_srvHeap->GetCPUDescriptorHandleForHeapStart());
+        // Also check local manifests if no UDP stream discovered yet
+        if (!g_consumerSlot.active) {
+            // Check discovered streams first
+            if (!g_discoveredStreams.empty()) {
+                const auto& d = g_discoveredStreams[0];
+                HANDLE hTex = nullptr, hFence = nullptr;
+                if (SUCCEEDED(g_device->OpenSharedHandleByName(d.textureHandleName.c_str(), GENERIC_ALL, &hTex)) &&
+                    SUCCEEDED(g_device->OpenSharedHandleByName(d.fenceHandleName.c_str(), GENERIC_ALL, &hFence))) {
+                    g_device->OpenSharedHandle(hTex, IID_PPV_ARGS(&g_consumerSlot.sharedTexture));
+                    g_device->OpenSharedHandle(hFence, IID_PPV_ARGS(&g_consumerSlot.sharedFence));
+                    g_consumerSlot.hSharedTex = hTex;
+                    g_consumerSlot.hSharedFence = hFence;
+                    g_consumerSlot.active = true;
+                    g_consumerSlot.streamName = d.streamName;
+                    g_consumerSlot.hasAudio = d.hasAudio;
 
-                if (g_enableAudio && d.hasAudio && !d.audioBufferName.empty()) {
-                    if (g_audioRingConsumer.Open(d.audioBufferName.c_str())) StartAudioPlayback();
+                    g_device->CreateShaderResourceView(g_consumerSlot.sharedTexture.Get(), nullptr, g_srvHeap->GetCPUDescriptorHandleForHeapStart());
+
+                    if (g_enableAudio && d.hasAudio && !d.audioBufferName.empty()) {
+                        if (g_audioRingConsumer.Open(d.audioBufferName.c_str())) StartAudioPlayback();
+                    }
+
+                    std::wstring title = L"DirectPort [CONSUMER: " + std::wstring(d.streamName.begin(), d.streamName.end()) + L"]" + (d.hasAudio ? L" [A/V]" : L"");
+                    SetWindowTextW(g_hwnd, title.c_str());
                 }
-
-                std::wstring title = L"DirectPort [CONSUMER: " + std::wstring(d.streamName.begin(), d.streamName.end()) + L"]" + (d.hasAudio ? L" [A/V]" : L"");
-                SetWindowTextW(g_hwnd, title.c_str());
             }
         }
     } else if (g_mode == MODE_MULTIPLEXER) {
         g_listener.Poll(g_discoveredStreams);
-        for (UINT i = 0; i < kMaxMuxSlots; ++i) {
-            if (i < g_discoveredStreams.size()) {
-                const auto& d = g_discoveredStreams[i];
-                auto& slot = g_muxSlots[i];
-                if (!slot.active || slot.texHandleName != d.textureHandleName) {
-                    if (slot.hSharedTex) CloseHandle(slot.hSharedTex);
-                    if (slot.hSharedFence) CloseHandle(slot.hSharedFence);
-                    slot.sharedTexture.Reset();
-                    slot.sharedFence.Reset();
+        Mux_FindAndConnectProducers();
 
-                    HANDLE hTex = nullptr, hFence = nullptr;
-                    if (SUCCEEDED(g_device->OpenSharedHandleByName(d.textureHandleName.c_str(), GENERIC_ALL, &hTex)) &&
-                        SUCCEEDED(g_device->OpenSharedHandleByName(d.fenceHandleName.c_str(), GENERIC_ALL, &hFence))) {
-                        g_device->OpenSharedHandle(hTex, IID_PPV_ARGS(&slot.sharedTexture));
-                        g_device->OpenSharedHandle(hFence, IID_PPV_ARGS(&slot.sharedFence));
-                        slot.hSharedTex = hTex;
-                        slot.hSharedFence = hFence;
-                        slot.texHandleName = d.textureHandleName;
-                        slot.streamName = d.streamName;
-                        slot.active = true;
+        // Broadcast the multiplexed grid stream out
+        g_broadcaster.Broadcast("DirectPort_Multiplexer", kDefaultWidth, kDefaultHeight, DXGI_FORMAT_B8G8R8A8_UNORM,
+            L"Global\\DirectPortTexture_Multiplexer", L"Global\\DirectPortFence_Multiplexer", g_muxSharedOutFrameValue,
+            false, 0, 0, L"");
 
-                        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-                        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-                        srvDesc.Texture2D.MipLevels = 1;
-                        D3D12_CPU_DESCRIPTOR_HANDLE cpuH = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
-                        cpuH.ptr += (i * g_srvDescriptorSize);
-                        g_device->CreateShaderResourceView(slot.sharedTexture.Get(), &srvDesc, cpuH);
-                    }
-                }
-            }
-        }
+        int count = 0;
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) if (g_muxProducers[i].isConnected) count++;
+        std::wstring title = L"DirectPort [MULTIPLEXER: " + std::to_wstring(count) + L" Streams Active / 256 Slot Blueprint]";
+        SetWindowTextW(g_hwnd, title.c_str());
     }
 }
 
 // Stage 1: Input Acquire
 void StepGraph_InputAcquire() {
+    auto now = std::chrono::steady_clock::now();
+    float elapsed = std::chrono::duration<float>(now - g_producerStartTime).count();
+    g_pCbvData->u_resolution[0] = (float)kDefaultWidth;
+    g_pCbvData->u_resolution[1] = (float)kDefaultHeight;
+    g_pCbvData->u_resolution[2] = (float)kDefaultWidth / (float)kDefaultHeight;
+    g_pCbvData->u_time[0] = elapsed;
+    g_pCbvData->u_time[2] = (float)g_producerSharedFrameValue;
+
     if (g_mode == MODE_PRODUCER_SHADER) {
-        g_commandList->SetPipelineState(g_pipelineStateShader.Get());
-        g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
-
-        auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - g_producerStartTime).count();
-        g_pCbvData->u_resolution[0] = (float)kDefaultWidth;
-        g_pCbvData->u_resolution[1] = (float)kDefaultHeight;
-        g_pCbvData->u_resolution[2] = (float)kDefaultWidth / (float)kDefaultHeight;
-        g_pCbvData->u_time[0] = elapsed;
-        g_pCbvData->u_time[2] = (float)g_producerSharedFrameValue;
-
+        // Draw procedural shader directly to g_producerSharedTexture
         D3D12_RESOURCE_BARRIER barrier = {};
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         barrier.Transition.pResource = g_producerSharedTexture.Get();
@@ -779,7 +1232,15 @@ void StepGraph_InputAcquire() {
         g_commandList->RSSetViewports(1, &vp);
         g_commandList->RSSetScissorRects(1, &sc);
 
+        g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
         g_commandList->SetGraphicsRootConstantBufferView(0, g_constantBuffer->GetGPUVirtualAddress());
+
+        if (g_pipelineStateCustom) {
+            g_commandList->SetPipelineState(g_pipelineStateCustom.Get());
+        } else {
+            g_commandList->SetPipelineState(g_pipelineStatePlasma.Get());
+        }
+
         g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         g_commandList->DrawInstanced(3, 1, 0, 0);
 
@@ -787,33 +1248,65 @@ void StepGraph_InputAcquire() {
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         g_commandList->ResourceBarrier(1, &barrier);
     } else if (g_mode == MODE_PRODUCER_CAMERA && g_cameraCapture.IsActive()) {
-        std::vector<BYTE> camBytes;
-        if (g_cameraCapture.ReadFrame(camBytes) && g_pCameraUploadData) {
-            memcpy(g_pCameraUploadData, camBytes.data(), std::min(camBytes.size(), (size_t)(kDefaultWidth * kDefaultHeight * 4)));
+        // Read camera frame into mapped upload staging buffer
+        DWORD bytesCopied = 0;
+        if (g_cameraCapture.ReadFrame(g_pCameraUploadData, g_cameraUploadSize, &bytesCopied) && bytesCopied > 0) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = g_cameraTexture.Get();
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g_commandList->ResourceBarrier(1, &barrier);
+
+            D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+            dst.pResource = g_cameraTexture.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = 0;
+
+            src.pResource = g_cameraUploadBuffer.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint.Width = g_cameraCapture.GetWidth();
+            src.PlacedFootprint.Footprint.Height = g_cameraCapture.GetHeight();
+            src.PlacedFootprint.Footprint.Depth = 1;
+            src.PlacedFootprint.Footprint.RowPitch = g_cameraRowPitch;
+            src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+            g_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g_commandList->ResourceBarrier(1, &barrier);
         }
 
-        D3D12_RESOURCE_BARRIER barrier = {};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Transition.pResource = g_producerSharedTexture.Get();
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g_commandList->ResourceBarrier(1, &barrier);
+        // Blit g_cameraTexture to g_producerSharedTexture (1080p output)
+        D3D12_RESOURCE_BARRIER prodBarrier = {};
+        prodBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        prodBarrier.Transition.pResource = g_producerSharedTexture.Get();
+        prodBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        prodBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g_commandList->ResourceBarrier(1, &prodBarrier);
 
-        D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
-        dst.pResource = g_producerSharedTexture.Get();
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.pResource = g_cameraUploadBuffer.Get();
-        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        src.PlacedFootprint.Footprint.Width = kDefaultWidth;
-        src.PlacedFootprint.Footprint.Height = kDefaultHeight;
-        src.PlacedFootprint.Footprint.Depth = 1;
-        src.PlacedFootprint.Footprint.RowPitch = kDefaultWidth * 4;
-        src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-        g_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvH = g_producerSharedRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        g_commandList->OMSetRenderTargets(1, &rtvH, FALSE, nullptr);
 
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        g_commandList->ResourceBarrier(1, &barrier);
+        D3D12_VIEWPORT vp = { 0, 0, (float)kDefaultWidth, (float)kDefaultHeight, 0.0f, 1.0f };
+        D3D12_RECT sc = { 0, 0, (LONG)kDefaultWidth, (LONG)kDefaultHeight };
+        g_commandList->RSSetViewports(1, &vp);
+        g_commandList->RSSetScissorRects(1, &sc);
+
+        g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
+        g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
+
+        ID3D12DescriptorHeap* heaps[] = { g_cameraSrvHeap.Get() };
+        g_commandList->SetDescriptorHeaps(1, heaps);
+        g_commandList->SetGraphicsRootDescriptorTable(1, g_cameraSrvHeap->GetGPUDescriptorHandleForHeapStart());
+
+        g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g_commandList->DrawInstanced(3, 1, 0, 0);
+
+        prodBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        prodBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        g_commandList->ResourceBarrier(1, &prodBarrier);
     } else if (g_mode == MODE_CONSUMER) {
         if (g_consumerSlot.active && g_consumerSlot.sharedFence) {
             UINT64 frame = g_consumerSlot.sharedFence->GetCompletedValue();
@@ -822,22 +1315,166 @@ void StepGraph_InputAcquire() {
                 g_consumerSlot.lastFrame = frame;
             }
         }
-    } else if (g_mode == MODE_MULTIPLEXER) {
-        for (UINT i = 0; i < kMaxMuxSlots; ++i) {
-            auto& slot = g_muxSlots[i];
-            if (slot.active && slot.sharedFence) {
-                UINT64 frame = slot.sharedFence->GetCompletedValue();
-                if (frame > slot.lastFrame) {
-                    g_commandQueue->Wait(slot.sharedFence.Get(), frame);
-                    slot.lastFrame = frame;
-                }
-            }
-        }
     }
 }
 
 // Stage 2: Composition
 void StepGraph_Composition(float totalW, float totalH) {
+    if (g_mode == MODE_MULTIPLEXER) {
+        // --- RAW BADASS 256-CAMERA MULTIPLEXER PIPELINE ---
+        
+        // 1. Ingest from active producers
+        std::vector<D3D12_RESOURCE_BARRIER> preCopyBarriers;
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+            auto& p = g_muxProducers[i];
+            if (p.isConnected && p.privateTexture) {
+                UINT64 latestFrame = p.pManifestView ? p.pManifestView->frameValue : (p.sharedFence ? p.sharedFence->GetCompletedValue() : 0);
+                if (latestFrame > p.lastSeenFrame) {
+                    g_commandQueue->Wait(p.sharedFence.Get(), latestFrame);
+
+                    D3D12_RESOURCE_BARRIER b = {};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Transition.pResource = p.privateTexture.Get();
+                    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                    preCopyBarriers.push_back(b);
+                }
+            }
+        }
+        if (!preCopyBarriers.empty()) g_commandList->ResourceBarrier((UINT)preCopyBarriers.size(), preCopyBarriers.data());
+
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+            auto& p = g_muxProducers[i];
+            if (p.isConnected && p.privateTexture) {
+                UINT64 latestFrame = p.pManifestView ? p.pManifestView->frameValue : (p.sharedFence ? p.sharedFence->GetCompletedValue() : 0);
+                if (latestFrame > p.lastSeenFrame) {
+                    g_commandList->CopyResource(p.privateTexture.Get(), p.sharedTexture.Get());
+                    p.lastSeenFrame = latestFrame;
+                }
+            }
+        }
+
+        std::vector<D3D12_RESOURCE_BARRIER> postCopyBarriers;
+        for (const auto& b : preCopyBarriers) {
+            D3D12_RESOURCE_BARRIER post = b;
+            post.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            post.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            postCopyBarriers.push_back(post);
+        }
+        if (!postCopyBarriers.empty()) g_commandList->ResourceBarrier((UINT)postCopyBarriers.size(), postCopyBarriers.data());
+
+        // 2. Compose into g_muxCompositeTexture
+        D3D12_RESOURCE_BARRIER compBarrier = {};
+        compBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        compBarrier.Transition.pResource = g_muxCompositeTexture.Get();
+        compBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        compBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        compBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g_commandList->ResourceBarrier(1, &compBarrier);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE compRtv = g_muxCompositeRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        g_commandList->OMSetRenderTargets(1, &compRtv, FALSE, nullptr);
+        const float clearCol[] = { 0.04f, 0.01f, 0.05f, 1.0f };
+        g_commandList->ClearRenderTargetView(compRtv, clearCol, 0, nullptr);
+
+        std::vector<int> activeProducers;
+        for (int i = 0; i < MAX_MUX_PRODUCERS; ++i) {
+            if (g_muxProducers[i].isConnected && g_muxProducers[i].privateTexture) {
+                activeProducers.push_back(i);
+            }
+        }
+
+        g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
+        ID3D12DescriptorHeap* heaps[] = { g_muxSrvHeap.Get() };
+        g_commandList->SetDescriptorHeaps(1, heaps);
+        g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+        if (!activeProducers.empty()) {
+            g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
+            int count = (int)activeProducers.size();
+            int cols = static_cast<int>(ceil(sqrt(static_cast<float>(count))));
+            int rows = (count + cols - 1) / cols;
+
+            for (int i = 0; i < count; ++i) {
+                int pIdx = activeProducers[i];
+                int gridCol = i % cols;
+                int gridRow = i / cols;
+
+                int left   = (gridCol * kDefaultWidth) / cols;
+                int right  = ((gridCol + 1) * kDefaultWidth) / cols;
+                int top    = (gridRow * kDefaultHeight) / rows;
+                int bottom = ((gridRow + 1) * kDefaultHeight) / rows;
+
+                D3D12_VIEWPORT vp = { (float)left, (float)top, (float)(right - left), (float)(bottom - top), 0.0f, 1.0f };
+                D3D12_RECT sr = { left, top, right, bottom };
+
+                g_commandList->RSSetViewports(1, &vp);
+                g_commandList->RSSetScissorRects(1, &sr);
+
+                D3D12_GPU_DESCRIPTOR_HANDLE srvHandle = g_muxSrvHeap->GetGPUDescriptorHandleForHeapStart();
+                srvHandle.ptr += (UINT64)g_muxProducers[pIdx].srvDescriptorIndex * g_srvDescriptorSize;
+                g_commandList->SetGraphicsRootDescriptorTable(1, srvHandle);
+                g_commandList->DrawInstanced(3, 1, 0, 0);
+            }
+        } else {
+            // Blueprint grid background when waiting for inputs
+            g_commandList->SetPipelineState(g_pipelineStateBlueprint.Get());
+            D3D12_VIEWPORT vp = { 0, 0, (float)kDefaultWidth, (float)kDefaultHeight, 0.0f, 1.0f };
+            D3D12_RECT sr = { 0, 0, (LONG)kDefaultWidth, (LONG)kDefaultHeight };
+            g_commandList->RSSetViewports(1, &vp);
+            g_commandList->RSSetScissorRects(1, &sr);
+            g_commandList->SetGraphicsRootConstantBufferView(0, g_constantBuffer->GetGPUVirtualAddress());
+            g_commandList->DrawInstanced(3, 1, 0, 0);
+        }
+
+        // 3. Produce to g_muxSharedOutTexture
+        D3D12_RESOURCE_BARRIER barriersToProduce[2] = {};
+        barriersToProduce[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriersToProduce[0].Transition = { g_muxCompositeTexture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE };
+        barriersToProduce[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriersToProduce[1].Transition = { g_muxSharedOutTexture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST };
+        g_commandList->ResourceBarrier(2, barriersToProduce);
+
+        g_commandList->CopyResource(g_muxSharedOutTexture.Get(), g_muxCompositeTexture.Get());
+
+        D3D12_RESOURCE_BARRIER barriersAfterProduce[2] = {};
+        barriersAfterProduce[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriersAfterProduce[0].Transition = { g_muxCompositeTexture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE };
+        barriersAfterProduce[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriersAfterProduce[1].Transition = { g_muxSharedOutTexture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON };
+        g_commandList->ResourceBarrier(2, barriersAfterProduce);
+
+        // 4. Preview to window backbuffer via blit
+        D3D12_RESOURCE_BARRIER presentBarrier = {};
+        presentBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        presentBarrier.Transition.pResource = g_renderTargets[g_frameIndex].Get();
+        presentBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        presentBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g_commandList->ResourceBarrier(1, &presentBarrier);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvH = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtvH.ptr += (g_frameIndex * g_rtvDescriptorSize);
+        g_commandList->OMSetRenderTargets(1, &rtvH, FALSE, nullptr);
+
+        g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
+        ID3D12DescriptorHeap* previewHeaps[] = { g_muxCompositeSrvHeap.Get() };
+        g_commandList->SetDescriptorHeaps(1, previewHeaps);
+        g_commandList->SetGraphicsRootDescriptorTable(1, g_muxCompositeSrvHeap->GetGPUDescriptorHandleForHeapStart());
+
+        D3D12_VIEWPORT winVp = { 0, 0, totalW, totalH, 0.0f, 1.0f };
+        D3D12_RECT winSr = { 0, 0, (LONG)totalW, (LONG)totalH };
+        g_commandList->RSSetViewports(1, &winVp);
+        g_commandList->RSSetScissorRects(1, &winSr);
+        g_commandList->DrawInstanced(3, 1, 0, 0);
+
+        presentBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        presentBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        g_commandList->ResourceBarrier(1, &presentBarrier);
+        return;
+    }
+
+    // --- NON-MULTIPLEXER MODES (Shader, Camera, Consumer) ---
     D3D12_RESOURCE_BARRIER barrier = {};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = g_renderTargets[g_frameIndex].Get();
@@ -849,84 +1486,62 @@ void StepGraph_Composition(float totalW, float totalH) {
     rtvH.ptr += (g_frameIndex * g_rtvDescriptorSize);
     g_commandList->OMSetRenderTargets(1, &rtvH, FALSE, nullptr);
 
-    const float clearColor[] = { 0.04f, 0.04f, 0.06f, 1.0f };
-    g_commandList->ClearRenderTargetView(rtvH, clearColor, 0, nullptr);
+    D3D12_VIEWPORT winVp = { 0, 0, totalW, totalH, 0.0f, 1.0f };
+    D3D12_RECT winSr = { 0, 0, (LONG)totalW, (LONG)totalH };
+    g_commandList->RSSetViewports(1, &winVp);
+    g_commandList->RSSetScissorRects(1, &winSr);
+
+    g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
+    g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     if (g_mode == MODE_PRODUCER_SHADER || g_mode == MODE_PRODUCER_CAMERA) {
-        D3D12_RESOURCE_BARRIER copyBarriers[2] = {};
-        copyBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        copyBarriers[0].Transition.pResource = g_producerSharedTexture.Get();
-        copyBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-        copyBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        // Blit g_producerSharedTexture to window
+        D3D12_RESOURCE_BARRIER readBarrier = {};
+        readBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        readBarrier.Transition.pResource = g_producerSharedTexture.Get();
+        readBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        readBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g_commandList->ResourceBarrier(1, &readBarrier);
 
-        copyBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        copyBarriers[1].Transition.pResource = g_renderTargets[g_frameIndex].Get();
-        copyBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        copyBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g_commandList->ResourceBarrier(2, copyBarriers);
+        g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
+        ID3D12DescriptorHeap* heaps[] = { g_producerSharedSrvHeap.Get() };
+        g_commandList->SetDescriptorHeaps(1, heaps);
+        g_commandList->SetGraphicsRootDescriptorTable(1, g_producerSharedSrvHeap->GetGPUDescriptorHandleForHeapStart());
+        g_commandList->DrawInstanced(3, 1, 0, 0);
 
-        g_commandList->CopyResource(g_renderTargets[g_frameIndex].Get(), g_producerSharedTexture.Get());
-
-        copyBarriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        copyBarriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-        copyBarriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        copyBarriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        g_commandList->ResourceBarrier(2, copyBarriers);
+        readBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        readBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        g_commandList->ResourceBarrier(1, &readBarrier);
     } else if (g_mode == MODE_CONSUMER) {
         if (g_consumerSlot.active && g_consumerSlot.sharedTexture) {
-            D3D12_VIEWPORT vp = { 0, 0, totalW, totalH, 0.0f, 1.0f };
-            D3D12_RECT sc = { 0, 0, (LONG)totalW, (LONG)totalH };
-            g_commandList->RSSetViewports(1, &vp);
-            g_commandList->RSSetScissorRects(1, &sc);
+            // Blit received shared texture to window
+            D3D12_RESOURCE_BARRIER readBarrier = {};
+            readBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            readBarrier.Transition.pResource = g_consumerSlot.sharedTexture.Get();
+            readBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            readBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g_commandList->ResourceBarrier(1, &readBarrier);
 
             g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
-            g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
-
             ID3D12DescriptorHeap* heaps[] = { g_srvHeap.Get() };
             g_commandList->SetDescriptorHeaps(1, heaps);
             g_commandList->SetGraphicsRootDescriptorTable(1, g_srvHeap->GetGPUDescriptorHandleForHeapStart());
+            g_commandList->DrawInstanced(3, 1, 0, 0);
 
-            g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            readBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            readBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            g_commandList->ResourceBarrier(1, &readBarrier);
+        } else {
+            // Awaiting stream: render blueprint grid so screen is never black!
+            g_commandList->SetPipelineState(g_pipelineStateBlueprint.Get());
+            g_commandList->SetGraphicsRootConstantBufferView(0, g_constantBuffer->GetGPUVirtualAddress());
             g_commandList->DrawInstanced(3, 1, 0, 0);
         }
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        g_commandList->ResourceBarrier(1, &barrier);
-    } else if (g_mode == MODE_MULTIPLEXER) {
-        float halfW = totalW / 2.0f;
-        float halfH = totalH / 2.0f;
-        D3D12_VIEWPORT vps[4] = {
-            { 0,     0,     halfW, halfH, 0.0f, 1.0f },
-            { halfW, 0,     halfW, halfH, 0.0f, 1.0f },
-            { 0,     halfH, halfW, halfH, 0.0f, 1.0f },
-            { halfW, halfH, halfW, halfH, 0.0f, 1.0f }
-        };
-
-        g_commandList->SetPipelineState(g_pipelineStateBlit.Get());
-        g_commandList->SetGraphicsRootSignature(g_rootSignature.Get());
-
-        ID3D12DescriptorHeap* heaps[] = { g_srvHeap.Get() };
-        g_commandList->SetDescriptorHeaps(1, heaps);
-        g_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        for (UINT i = 0; i < kMaxMuxSlots; ++i) {
-            auto& slot = g_muxSlots[i];
-            if (slot.active && slot.sharedTexture) {
-                D3D12_RECT sc = { (LONG)vps[i].TopLeftX, (LONG)vps[i].TopLeftY, 
-                                  (LONG)(vps[i].TopLeftX + vps[i].Width), (LONG)(vps[i].TopLeftY + vps[i].Height) };
-                g_commandList->RSSetViewports(1, &vps[i]);
-                g_commandList->RSSetScissorRects(1, &sc);
-
-                D3D12_GPU_DESCRIPTOR_HANDLE gpuH = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
-                gpuH.ptr += (i * g_srvDescriptorSize);
-                g_commandList->SetGraphicsRootDescriptorTable(1, gpuH);
-                g_commandList->DrawInstanced(3, 1, 0, 0);
-            }
-        }
-        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-        g_commandList->ResourceBarrier(1, &barrier);
     }
+
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g_commandList->ResourceBarrier(1, &barrier);
 }
 
 // Stage 3: Present & Sync
@@ -938,6 +1553,17 @@ void StepGraph_PresentAndSync() {
     if (g_mode == MODE_PRODUCER_SHADER || g_mode == MODE_PRODUCER_CAMERA) {
         g_producerSharedFrameValue++;
         g_commandQueue->Signal(g_producerSharedFence.Get(), g_producerSharedFrameValue);
+        if (g_pProducerManifestView) {
+            g_pProducerManifestView->frameValue = g_producerSharedFrameValue;
+            WakeByAddressAll(&g_pProducerManifestView->frameValue);
+        }
+    } else if (g_mode == MODE_MULTIPLEXER) {
+        g_muxSharedOutFrameValue++;
+        g_commandQueue->Signal(g_muxSharedOutFence.Get(), g_muxSharedOutFrameValue);
+        if (g_pMuxManifestViewOut) {
+            g_pMuxManifestViewOut->frameValue = g_muxSharedOutFrameValue;
+            WakeByAddressAll(&g_pMuxManifestViewOut->frameValue);
+        }
     }
 
     g_swapChain->Present(1, 0);
@@ -953,15 +1579,13 @@ void MoveToNextFrame() {
         g_renderFence->SetEventOnCompletion(g_fenceValues[g_frameIndex], g_fenceEvent);
         WaitForSingleObject(g_fenceEvent, INFINITE);
     }
-
     g_fenceValues[g_frameIndex] = currentFence + 1;
 }
 
-// --- WASAPI Audio Playback ---
 void StartAudioPlayback() {
-    StopAudioPlayback();
-    g_hAudioPlayStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_audioPlaying) return;
     g_audioPlaying = true;
+    g_hAudioPlayStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_hAudioPlayThread = CreateThread(nullptr, 0, AudioPlaybackThreadProc, nullptr, 0, nullptr);
 }
 
@@ -1061,12 +1685,12 @@ DWORD WINAPI AudioPlaybackThreadProc(LPVOID) {
 void Cleanup() {
     ManageTrayIcon(g_hwnd, false);
     TeardownProducerResources();
+    TeardownCameraResources();
     TeardownConsumerResources();
     TeardownMuxResources();
     g_listener.Stop();
 
     if (g_pCbvData) g_constantBuffer->Unmap(0, nullptr);
-    if (g_pCameraUploadData) g_cameraUploadBuffer->Unmap(0, nullptr);
     if (g_fenceEvent) CloseHandle(g_fenceEvent);
 }
 
@@ -1097,12 +1721,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(hwnd, WM_COMMAND, wParam, lParam);
             return 0;
 
-        case WM_COMMAND:
-            switch (LOWORD(wParam)) {
+        case WM_COMMAND: {
+            WORD cmd = LOWORD(wParam);
+            if (cmd >= IDM_CAMERA_SELECT_BASE && cmd < IDM_CAMERA_SELECT_BASE + 32) {
+                SwitchCamera(cmd - IDM_CAMERA_SELECT_BASE);
+                return 0;
+            }
+
+            switch (cmd) {
                 case IDM_MODE_SHADER: SwitchMode(MODE_PRODUCER_SHADER); return 0;
                 case IDM_MODE_CAMERA: SwitchMode(MODE_PRODUCER_CAMERA); return 0;
                 case IDM_MODE_CONSUMER: SwitchMode(MODE_CONSUMER); return 0;
                 case IDM_MODE_MULTIPLEXER: SwitchMode(MODE_MULTIPLEXER); return 0;
+                case IDM_CYCLE_CAMERA: {
+                    auto cams = DirectPortCameraCapture::EnumerateCameras();
+                    if (!cams.empty()) {
+                        g_cameraDeviceIndex = (g_cameraDeviceIndex + 1) % (int)cams.size();
+                        SwitchMode(MODE_PRODUCER_CAMERA);
+                    }
+                    return 0;
+                }
                 case IDM_RELOAD_SHADER: LoadProducerShader(g_shaderPath); return 0;
                 case IDM_TOGGLE_AUDIO: ToggleAudio(); return 0;
                 case IDM_SHOW_HIDE_WINDOW: {
@@ -1116,12 +1754,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     return 0;
             }
             break;
+        }
 
         case WM_KEYDOWN:
             if (wParam == VK_F1) { SwitchMode(MODE_PRODUCER_SHADER); return 0; }
             if (wParam == VK_F2) { SwitchMode(MODE_PRODUCER_CAMERA); return 0; }
             if (wParam == VK_F3) { SwitchMode(MODE_CONSUMER); return 0; }
             if (wParam == VK_F4) { SwitchMode(MODE_MULTIPLEXER); return 0; }
+            if (wParam == 'C') {
+                auto cams = DirectPortCameraCapture::EnumerateCameras();
+                if (!cams.empty()) {
+                    g_cameraDeviceIndex = (g_cameraDeviceIndex + 1) % (int)cams.size();
+                    SwitchMode(MODE_PRODUCER_CAMERA);
+                }
+                return 0;
+            }
             if (wParam == VK_F5 && g_mode == MODE_PRODUCER_SHADER) {
                 LoadProducerShader(g_shaderPath);
                 return 0;

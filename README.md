@@ -68,16 +68,17 @@ The codebase compiles into a single, compact **499 KB unmanaged Windows AMD64 ex
 
 Modes can be set via command-line flags or toggled dynamically in the running window:
 
-* **`F1` — Producer (HLSL Shader)**: Evaluates dynamic shaders (default `shaders/plasma.hlsl` or `shaders/smpte.hlsl`). Press **`F5`** for instant live hot-reload without restarting.
-* **`F2` — Producer (Live Camera)**: Captures physical UVC webcam streams at hardware resolution via Media Foundation (`IMFSourceReader`) directly into VRAM.
-* **`F3` — Consumer (Auto-Listen)**: Automatically discovers running producers, attaches to shared NT handles, and queues GPU hardware waits.
-* **`F4` — Multiplexer (4-Way Grid)**: Discovers multiple producers and composites them into a synchronized 2x2 multi-camera grid.
+* **`F1` — Producer (HLSL Shader)**: Evaluates dynamic shaders (embedded plasma fallback or loose `shaders/plasma.hlsl`). Press **`F5`** for instant live hot-reload without restarting.
+* **`F2` — Producer (Live Camera)**: Enumerates physical UVC webcams (Media Foundation `IMFSourceReader`), capturing directly into aligned VRAM buffers. Press **`C`** to cycle cameras.
+* **`F3` — Consumer (Auto-Listen)**: Automatically discovers running producers, attaches to shared NT handles, and queues GPU hardware waits. Displays active blueprint status when scanning.
+* **`F4` — Multiplexer (256-Camera Blueprint)**: Raw badass D3D12 multiplexer from `DirectPort-Legacy`. Dynamically computes $N \times M$ grid viewports (`cols = ceil(sqrt(count))`), arranges up to 256 simultaneous streams, produces the composited grid as `DirectPort_Multiplexer`, and blits local preview.
+* **`C` — Cycle Camera**: Cycles through all enumerated physical and virtual video capture devices.
 * **`M` — Audio Toggle**: Mutes or unmutes the synchronized WASAPI loopback audio stream.
 * **`Esc` / `Q` — Exit**: Clean shutdown releasing all NT object handles.
 
 ### Windows 11 System Tray & Acrylic Context Menu
 
-Imported directly from **VirtuaCam**, `DirectPort.exe` lives in the Windows notification area (system tray). Right-clicking the tray icon or the window client area opens a dark-mode Acrylic context menu with generational VOM handle safety, allowing instantaneous mode switching without command-line flags.
+Imported directly from **VirtuaCam**, `DirectPort.exe` lives in the Windows notification area (system tray). Right-clicking the tray icon or the window client area opens a dark-mode Acrylic context menu with generational VOM handle safety, dynamically enumerating all connected webcams by friendly name and allowing instantaneous mode switching without command-line flags.
 
 ---
 
@@ -147,7 +148,7 @@ DirectPort/
 
 | Package | SHA-512 Checksum | Description |
 | :--- | :--- | :--- |
-| **`DirectPort-v0.2.0-Core.zip`** | `8a6c28db715ad937435b3732045fbc2345e3d4c470d77ef58b6ff9dca27dd6585060693206dc7d372773f020429ca7cc5fd64dcb599825978be8df23421abca1` | Unified binary, headers, shaders, icon, and sources |
+| **`DirectPort-v0.2.0-Core.zip`** | `6db4c7171d2644b95cac4505d09be4a30bb59dd62016b9110f8e4f718d97ef0dee634feb99bd7bf370eb89a030f40bcd749d24135dc2b42bedc79185145cb1e5` | Unified binary, 256-slot multiplexer blueprint, camera enumeration, headers, and shaders |
 
 Verify with PowerShell:
 ```powershell
