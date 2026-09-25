@@ -68,10 +68,10 @@ The codebase compiles into a single, compact **499 KB unmanaged Windows AMD64 ex
 
 Modes can be set via command-line flags or toggled dynamically in the running window:
 
-* **`F1` — Producer (HLSL Shader)**: Evaluates dynamic shaders (embedded plasma fallback or loose `shaders/plasma.hlsl`). Press **`F5`** for instant live hot-reload without restarting.
-* **`F2` — Producer (Live Camera)**: Enumerates physical UVC webcams (Media Foundation `IMFSourceReader`), capturing directly into aligned VRAM buffers. Press **`C`** to cycle cameras.
-* **`F3` — Consumer (Auto-Listen)**: Automatically discovers running producers, attaches to shared NT handles, and queues GPU hardware waits. Displays active blueprint status when scanning.
-* **`F4` — Multiplexer (256-Camera Blueprint)**: Raw badass D3D12 multiplexer from `DirectPort-Legacy`. Dynamically computes $N \times M$ grid viewports (`cols = ceil(sqrt(count))`), arranges up to 256 simultaneous streams, produces the composited grid as `DirectPort_Multiplexer`, and blits local preview.
+* **`1` — Producer (HLSL Shader)**: Evaluates dynamic shaders (embedded plasma fallback or loose `shaders/plasma.hlsl`). Press **`5`** for instant live hot-reload without restarting.
+* **`2` — Producer (Live Camera)**: Enumerates physical UVC webcams (Media Foundation `IMFSourceReader`), capturing directly into aligned VRAM buffers. Press **`C`** to cycle cameras.
+* **`3` — Consumer (Auto-Listen)**: Automatically discovers running producers, attaches to shared NT handles, and queues GPU hardware waits. Displays active blueprint status when scanning.
+* **`4` — Multiplexer (256-Camera Blueprint)**: Raw badass D3D12 multiplexer from `DirectPort-Legacy`. Dynamically computes $N \times M$ grid viewports (`cols = ceil(sqrt(count))`), arranges up to 256 simultaneous streams, produces the composited grid as `DirectPort_Multiplexer`, and blits local preview.
 * **`C` — Cycle Camera**: Cycles through all enumerated physical and virtual video capture devices.
 * **`M` — Audio Toggle**: Mutes or unmutes the synchronized WASAPI loopback audio stream.
 * **`Esc` / `Q` — Exit**: Clean shutdown releasing all NT object handles.
