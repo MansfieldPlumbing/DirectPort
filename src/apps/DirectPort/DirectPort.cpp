@@ -477,10 +477,10 @@ void ManageTrayIcon(HWND hwnd, bool add) {
 
 void ShowContextMenu(HWND hwnd, POINT pt) {
     auto* menu = new PopupMenu(hwnd, g_instance);
-    menu->AddItem(L"Producer: procedural shader  (F1)", IDM_MODE_SHADER, g_mode == MODE_PRODUCER_SHADER);
-    menu->AddItem(L"Producer: live camera  (F2)", IDM_MODE_CAMERA, g_mode == MODE_PRODUCER_CAMERA);
-    menu->AddItem(L"Consumer: auto-listen  (F3)", IDM_MODE_CONSUMER, g_mode == MODE_CONSUMER);
-    menu->AddItem(L"Multiplexer: grid of all streams  (F4)", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
+    menu->AddItem(L"Producer: procedural shader  (1)", IDM_MODE_SHADER, g_mode == MODE_PRODUCER_SHADER);
+    menu->AddItem(L"Producer: live camera  (2)", IDM_MODE_CAMERA, g_mode == MODE_PRODUCER_CAMERA);
+    menu->AddItem(L"Consumer: auto-listen  (3)", IDM_MODE_CONSUMER, g_mode == MODE_CONSUMER);
+    menu->AddItem(L"Multiplexer: grid of all streams  (4)", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
     menu->AddSeparator();
 
     auto cams = DirectPortCameraCapture::EnumerateCameras();
@@ -494,7 +494,7 @@ void ShowContextMenu(HWND hwnd, POINT pt) {
         cameras->AddItem(L"Next camera  (C)", IDM_CYCLE_CAMERA);
     }
 
-    menu->AddItem(L"Reload HLSL shader  (F5)", IDM_RELOAD_SHADER);
+    menu->AddItem(L"Reload HLSL shader  (5)", IDM_RELOAD_SHADER);
     menu->AddItem(L"Audio  (M)", IDM_TOGGLE_AUDIO, g_enableAudio);
     menu->AddSeparator();
     menu->AddItem(IsWindowVisible(hwnd) ? L"Hide window" : L"Show window", IDM_SHOW_HIDE_WINDOW);
@@ -1110,7 +1110,7 @@ void SwitchMode(DirectPortAppMode newMode) {
     switch (g_mode) {
         case MODE_PRODUCER_SHADER:
             InitProducerSharedResources();
-            SetWindowTextW(g_hwnd, L"DirectPort [PRODUCER: HLSL Shader (1920x1080)] // F1: Shader | F5: Reload");
+            SetWindowTextW(g_hwnd, L"DirectPort [PRODUCER: HLSL Shader (1920x1080)] // 1: Shader | 5: Reload");
             break;
 
         case MODE_PRODUCER_CAMERA:
@@ -1123,18 +1123,18 @@ void SwitchMode(DirectPortAppMode newMode) {
             {
                 std::wstring title = L"DirectPort [PRODUCER: " + g_cameraCapture.GetDeviceName() + 
                     L" (" + std::to_wstring(g_cameraCapture.GetWidth()) + L"x" + std::to_wstring(g_cameraCapture.GetHeight()) + 
-                    L")] // F2: Cam | C: Cycle";
+                    L")] // 2: Cam | C: Cycle";
                 SetWindowTextW(g_hwnd, title.c_str());
             }
             break;
 
         case MODE_CONSUMER:
-            SetWindowTextW(g_hwnd, L"DirectPort [CONSUMER: Scanning 127.0.0.1:3987 & Manifests...] // F3");
+            SetWindowTextW(g_hwnd, L"DirectPort [CONSUMER: Scanning 127.0.0.1:3987 & Manifests...] // 3");
             break;
 
         case MODE_MULTIPLEXER:
             InitMuxResources();
-            SetWindowTextW(g_hwnd, L"DirectPort [MULTIPLEXER: 256-Camera Blueprint Active] // F4");
+            SetWindowTextW(g_hwnd, L"DirectPort [MULTIPLEXER: 256-Camera Blueprint Active] // 4");
             break;
     }
 }
@@ -1802,10 +1802,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_KEYDOWN:
-            if (wParam == VK_F1) { SwitchMode(MODE_PRODUCER_SHADER); return 0; }
-            if (wParam == VK_F2) { SwitchMode(MODE_PRODUCER_CAMERA); return 0; }
-            if (wParam == VK_F3) { SwitchMode(MODE_CONSUMER); return 0; }
-            if (wParam == VK_F4) { SwitchMode(MODE_MULTIPLEXER); return 0; }
+            // Number row (and numpad) pick modes; 5 reloads the shader.
+            if (wParam >= VK_NUMPAD1 && wParam <= VK_NUMPAD5) wParam = '1' + (wParam - VK_NUMPAD1);
+            if (wParam == '1') { SwitchMode(MODE_PRODUCER_SHADER); return 0; }
+            if (wParam == '2') { SwitchMode(MODE_PRODUCER_CAMERA); return 0; }
+            if (wParam == '3') { SwitchMode(MODE_CONSUMER); return 0; }
+            if (wParam == '4') { SwitchMode(MODE_MULTIPLEXER); return 0; }
             if (wParam == 'C') {
                 auto cams = DirectPortCameraCapture::EnumerateCameras();
                 if (!cams.empty()) {
@@ -1814,7 +1816,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 return 0;
             }
-            if (wParam == VK_F5 && g_mode == MODE_PRODUCER_SHADER) {
+            if (wParam == '5' && g_mode == MODE_PRODUCER_SHADER) {
                 LoadProducerShader(g_shaderPath);
                 return 0;
             }
