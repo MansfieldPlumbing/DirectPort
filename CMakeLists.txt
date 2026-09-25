@@ -10,6 +10,7 @@ set(DIRECTPORT_WIN_LIBS
     dxgi
     d3dcompiler
     dwmapi
+    shcore
     uxtheme
     msimg32
     user32

@@ -78,7 +78,7 @@ Modes can be set via command-line flags or toggled dynamically in the running wi
 
 ### Windows 11 System Tray & Acrylic Context Menu
 
-Imported directly from **VirtuaCam**, `DirectPort.exe` lives in the Windows notification area (system tray). Right-clicking the tray icon or the window client area opens a dark-mode Acrylic context menu with generational VOM handle safety, dynamically enumerating all connected webcams by friendly name and allowing instantaneous mode switching without command-line flags.
+`DirectPort.exe` lives in the Windows notification area (system tray). Right-clicking the tray icon or the window opens a dark Mica Alt context menu that lists every connected webcam by name and switches modes without command-line flags.
 
 ---
 
@@ -111,9 +111,6 @@ Chromium's sandboxing blocks arbitrary Win32 NT handle imports into WebGL/WebGPU
 
 ```text
 DirectPort/
-├── dist/
-│   ├── DirectPort-v0.2.0-Core.zip   # Official release package
-│   └── SHA512SUMS.txt               # NIST SHA-512 verification ledger
 ├── docs/
 │   ├── directport.png               # Toilet-in-VRAM logo badge
 │   └── directport.ico               # Multi-resolution Win32 application icon
@@ -125,8 +122,8 @@ DirectPort/
 │   │   └── DirectPort/              # Unified application binary
 │   │       ├── DirectPort.cpp       # Single-window linear DAG & message pump
 │   │       ├── DirectPort.rc        # Resource script with embedded icon
-│   │       ├── Menu.h               # VirtuaCam Acrylic context menu header
-│   │       └── Menu.cpp             # Generational VOM menu implementation
+│   │       ├── Menu.h               # Mica Alt tray menu
+│   │       └── Menu.cpp
 │   ├── sdk/                         # Clean C/C++ transport layer
 │   │   ├── directport.h             # Core DirectPort C-ABI API
 │   │   ├── DirectPort_Discovery.h   # Non-blocking UDP beacon & listener
@@ -140,19 +137,6 @@ DirectPort/
 └── legacy/                          # Historical prototypes (quarantined)
     ├── Examples/                    # Early polling-based prototypes
     └── python/                      # Quarantined Python bindings & scripts
-```
-
----
-
-## 7. Release Verification (NIST SP 800-218)
-
-| Package | SHA-512 Checksum | Description |
-| :--- | :--- | :--- |
-| **`DirectPort-v0.2.0-Core.zip`** | `6db4c7171d2644b95cac4505d09be4a30bb59dd62016b9110f8e4f718d97ef0dee634feb99bd7bf370eb89a030f40bcd749d24135dc2b42bedc79185145cb1e5` | Unified binary, 256-slot multiplexer blueprint, camera enumeration, headers, and shaders |
-
-Verify with PowerShell:
-```powershell
-Get-FileHash -Algorithm SHA512 .\dist\DirectPort-v0.2.0-Core.zip
 ```
 
 ---

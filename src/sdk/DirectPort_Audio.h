@@ -197,7 +197,7 @@ public:
             m_running = false;
             if (m_hStopEvent) SetEvent(m_hStopEvent);
             if (m_hThread) {
-                WaitForSingleObject(m_hThread, 1000);
+                WaitForSingleObject(m_hThread, INFINITE);   // exits promptly once stop is set
                 CloseHandle(m_hThread);
                 m_hThread = nullptr;
             }
@@ -237,8 +237,18 @@ private:
             return 1;
         }
 
-        REFERENCE_TIME hnsBufferDuration = 10000000; // 1 second
-        if (FAILED(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, hnsBufferDuration, 0, pwfx, nullptr))) {
+        // Event-driven loopback: the audio engine signals `ready` each period,
+        // so the thread sleeps until there is data (no fixed-interval polling).
+        REFERENCE_TIME hnsBufferDuration = 2000000; // 200 ms
+        if (FAILED(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                           hnsBufferDuration, 0, pwfx, nullptr))) {
+            CoTaskMemFree(pwfx);
+            CoUninitialize();
+            return 1;
+        }
+        HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!ready || FAILED(audioClient->SetEventHandle(ready))) {
+            if (ready) CloseHandle(ready);
             CoTaskMemFree(pwfx);
             CoUninitialize();
             return 1;
@@ -255,7 +265,8 @@ private:
 
         std::vector<float> floatConversionBuffer;
 
-        while (WaitForSingleObject(self->m_hStopEvent, 10) == WAIT_TIMEOUT) {
+        const HANDLE waits[] = { self->m_hStopEvent, ready };
+        while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
             UINT32 packetLength = 0;
             if (FAILED(captureClient->GetNextPacketSize(&packetLength))) break;
 
@@ -294,6 +305,7 @@ private:
         }
 
         audioClient->Stop();
+        CloseHandle(ready);
         CoTaskMemFree(pwfx);
         CoUninitialize();
         return 0;
