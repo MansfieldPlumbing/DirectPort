@@ -298,8 +298,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
     RegisterClassExW(&wcex);
     
     DWORD pid = GetCurrentProcessId();
-    g_sharedTextureName = L"Global\\DirectPortTexture_" + std::to_wstring(pid);
-    g_sharedFenceName = L"Global\\DirectPortFence_" + std::to_wstring(pid);
+    g_sharedTextureName = L"Local\\DirectPortTexture_" + std::to_wstring(pid);
+    g_sharedFenceName = L"Local\\DirectPortFence_" + std::to_wstring(pid);
     
     // Placeholder title; dynamically populated after Manifest bounds to GPU Adapter
     WCHAR placeholderTitle[] = L"DirectPort Producer (D3D12) - Initializing...";

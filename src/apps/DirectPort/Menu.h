@@ -1,82 +1,67 @@
+// =============================================================================
+// Menu.h  --  Custom-drawn tray menu (Mica Alt, dark, rounded)
+// =============================================================================
+// A small popup-menu implementation matching Windows 11 styling.  Ownership is simple: the caller
+// news the top-level menu and Show()s it; it deletes itself when its window
+// is destroyed.  Submenus are owned by their parent item.
+// =============================================================================
+
 #pragma once
-#include <cstdint>
-#include <vector>
-#include <string>
+
+#include <windows.h>
 #include <memory>
-#include <functional>
+#include <string>
+#include <vector>
 
-#ifndef WM_APP_MENU_COMMAND
-#define WM_APP_MENU_COMMAND (WM_APP + 2)
-#endif
+// WM_APP message the menu sends to its owner window: wParam = command id.
+constexpr UINT WM_APP_MENU_COMMAND = WM_APP + 2;
 
-class CustomMenu;
-
-struct CustomMenuItem {
-    std::wstring text;
-    UINT id;
-    bool isSeparator = false;
-    bool isChecked = false;
-    bool isSubMenu = false;
-    bool isPreview = false;   // Live video thumbnail item (see SetPreviewProvider)
-    std::unique_ptr<CustomMenu> subMenu;
-};
-
-// Fills `bgra` with a top-down 32-bit BGRA frame (alpha forced opaque) and
-// reports its dimensions.  Returns false when no frame is available.
-using MenuPreviewProvider = std::function<bool(std::vector<uint32_t>& bgra, UINT& width, UINT& height)>;
-
-class CustomMenu {
+class PopupMenu {
 public:
-    CustomMenu(HWND parent, HINSTANCE instance);
-    ~CustomMenu();
+    PopupMenu(HWND owner, HINSTANCE instance);
+    ~PopupMenu();
 
-    void AddItem(const std::wstring& text, UINT id, bool checked = false);
+    void AddItem(const std::wstring& text, UINT id, bool checked = false, bool enabled = true);
     void AddSeparator();
-    // Adds a live preview thumbnail; clicking it sends `id` like a normal item.
-    void AddPreviewItem(UINT id);
-    CustomMenu* AddSubMenu(const std::wstring& text);
-    void Show(int x, int y);
-    HWND GetHwnd() const;
-    static void CloseAllMenus();
-    // Source of preview frames (set once at startup by the UI layer).
-    static void SetPreviewProvider(MenuPreviewProvider provider);
+    PopupMenu* AddSubMenu(const std::wstring& text);
 
-    int GetCalculatedWidth() const;
-    int GetCalculatedHeight() const;
-    
-    // VOM-style handle registration for deterministic cleanup
-    void RegisterHandle();
-    void UnregisterHandle();
-    UINT GetHandleId() const { return m_handleId; }
-    
-    // Process-wide cleanup for handle table
-    static void CleanupHandles();
+    // Shows the menu anchored at a screen point (flipped to stay on-screen).
+    void ShowAt(POINT anchor);
+
+    static void CloseAll();
+    static bool IsOpen();
 
 private:
-    void CalculateOptimalWidth();
-    int ItemHeight(const CustomMenuItem& item) const;
-    static LRESULT CALLBACK MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-    LRESULT HandleMessage(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
-    void Draw(HDC hdc, HANDLE paintBuffer);   // HANDLE == HPAINTBUFFER (uxtheme)
-    void CloseChildren();
-    void HandleMouseMove(POINT clientPt);
-    static void SignalCloseEvent(UINT handleId);
+    struct Item {
+        std::wstring text;
+        UINT id = 0;
+        bool separator = false;
+        bool checked = false;
+        bool enabled = true;
+        std::unique_ptr<PopupMenu> subMenu;
+    };
 
-    HWND m_hwnd;
-    HWND m_parentHwnd;
-    HINSTANCE m_instance;
-    std::vector<CustomMenuItem> m_items;
+    void Show(int x, int y);
+    int Width() const;
+    int Height() const;
+    int ItemHeight(const Item& item) const;
+    RECT ItemRect(size_t index) const;
+    int HitTest(POINT client) const;
+    void Hover(int index);
+    void OpenSubMenu(int index);
+    void CloseSubMenu();
+    void Paint(HDC hdc);
 
-    int m_itemHeight = 32;
-    mutable int m_calculatedWidth = 0;
-    int m_hoverItem = -1;
-    bool m_hasPreview = false;
+    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam);
 
-    CustomMenu* m_parentMenu = nullptr;
-    CustomMenu* m_activeSubMenu = nullptr;
-    int m_activeSubMenuItem = -1;
-    
-    // VOM handle tracking
-    UINT m_handleId;
-    UINT m_generation;
+    HWND m_hwnd = nullptr;
+    HWND m_owner = nullptr;
+    HINSTANCE m_instance = nullptr;
+    PopupMenu* m_parent = nullptr;
+    PopupMenu* m_openSub = nullptr;
+    std::vector<Item> m_items;
+    int m_hover = -1;
+    int m_dpi = 96;
+    mutable int m_width = 0;
 };

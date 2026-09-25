@@ -1,710 +1,462 @@
 // =============================================================================
-// Menu.cpp  --  Custom tray context menu with VOM-style handle management
+// Menu.cpp  --  Custom-drawn tray menu
 // =============================================================================
-// A custom-drawn popup menu with a Windows 11 look:
-//   - Real DWM Mica/Acrylic: the window extends its frame into the client area
-//     (DwmExtendFrameIntoClientArea) and paints with per-pixel alpha through a
-//     buffered paint DIB, so the DWMSBT_TRANSIENTWINDOW backdrop shows through.
-//     Text must therefore be drawn with DrawThemeTextEx(DTT_COMPOSITED) -- plain
-//     GDI text writes alpha 0 and would be invisible on the backdrop.
-//   - Rounded corners via DWMWA_WINDOW_CORNER_PREFERENCE.
-//   - An optional live preview item (AddPreviewItem) that shows the camera
-//     output as a thumbnail, refreshed by a timer while the menu is open.
+// Look: the window extends its frame over the whole client area and asks DWM
+// for the Mica Alt backdrop (DWMSBT_TABBEDWINDOW), dark mode and rounded
+// corners.  Painting goes through a 32bpp buffered-paint DIB so per-pixel
+// alpha reaches DWM; text therefore uses DrawThemeTextEx(DTT_COMPOSITED),
+// since plain GDI text would come out fully transparent.
 //
-// Ownership model: the top-level menu is heap-allocated by the caller and
-// deletes itself on WM_NCDESTROY.  Submenus are owned by their parent's
-// CustomMenuItem::subMenu unique_ptr and must NOT delete themselves -- their
-// windows are destroyed with the owner chain, but the objects die with the
-// parent.  (Deleting in both places was a heap-corrupting double delete.)
-//
-// VIRTUAL OBJECT MANAGER (VOM) PATTERN:
-// -------------------------------------
-// This file implements a kernel-mode-inspired handle table for menu objects to
-// solve DEADLOCK and FOCUS-SHIFT cleanup issues:
-//
-// PROBLEM: The original implementation had race conditions where:
-//   - User clicks away from menu -> focus shifts -> menu should close
-//   - But WM_KILLFOCUS arrived after other messages, causing stale pointers
-//   - UI thread blocked waiting for background threads holding menu references
-//   - Result: Deadlock or leaked menu windows floating on screen
-//
-// SOLUTION: Generational handle table (like Windows kernel object manager):
-//   - Each menu gets a unique handle ID (monotonically increasing counter)
-//   - HandleEntry contains: Menu pointer, RefCount, Generation, CloseEvent
-//   - Critical section protects the entire handle table (thread-safe)
-//   - CloseEvent (manual-reset) signals deterministic cleanup completion
-//   - Stale generations rejected O(1) - prevents use-after-free
-//
-// LIFECYCLE:
-//   1. Show() -> RegisterHandle() -> allocates ID, creates event, stores entry
-//   2. WM_KILLFOCUS -> CloseAllMenus() -> signals close events
-//   3. WM_DESTROY -> UnregisterHandle() -> signals event, removes from table
-//   4. Process shutdown -> CleanupHandles() -> ensures all events signaled
-//
-// WHY THIS WORKS:
-//   - No cross-thread blocking: handle table uses short critical section locks
-//   - Deterministic cleanup: events signal completion, no polling needed
-//   - Focus-shift safe: WM_KILLFOCUS triggers immediate cleanup cascade
-//   - Generational safety: old handle IDs fail validation after teardown
+// Input: the root menu holds mouse capture while open, so every click --
+// inside any open submenu or anywhere else on screen -- arrives here and is
+// routed by screen position.  Losing capture (Alt+Tab, another app grabbing
+// the mouse) closes the whole chain.
 // =============================================================================
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <windowsx.h>
-#include <dwmapi.h>
-#include <uxtheme.h>
-#include <vector>
-#include <string>
-#include <memory>
-#include <functional>
-#include <algorithm>
-#include <unordered_map>
 #include "Menu.h"
+
 #include <dwmapi.h>
-#include <windowsx.h>
+#include <shellscalingapi.h>
 #include <uxtheme.h>
-#include <vector>
+#include <windowsx.h>
 #include <algorithm>
-#include <unordered_map>
 
-#pragma comment(lib, "uxtheme.lib")
-#pragma comment(lib, "msimg32.lib")   // AlphaBlend
+namespace {
 
-const wchar_t POPUP_MENU_CLASS[] = L"VirtuaCamCustomMenu";
+constexpr wchar_t kMenuClass[] = L"VirtuaCamPopupMenu";
+constexpr int kItemHeight = 32;
+constexpr int kSeparatorHeight = 9;
 
-// VOM-style handle table for menu objects - thread-safe, generational handles
-struct MenuHandleEntry {
-    CustomMenu* Menu;
-    LONG RefCount;
-    UINT Generation;
-    HANDLE CloseEvent;  // Manual-reset event for deterministic cleanup signaling
-};
+std::vector<PopupMenu*> g_open;          // open menus, root first
 
-static std::unordered_map<UINT, MenuHandleEntry> g_menuHandles;
-static UINT g_menuHandleCounter = 0;
-static CRITICAL_SECTION g_menuHandleLock;
-static CustomMenu* g_topLevelMenu = nullptr;
-static std::vector<CustomMenu*> g_openMenus;
-static MenuPreviewProvider g_previewProvider;
+int Scale(int value, int dpi) { return MulDiv(value, dpi, 96); }
 
-static constexpr UINT_PTR PREVIEW_TIMER_ID = 1;
-static constexpr UINT PREVIEW_TIMER_MS = 66;   // ~15 fps thumbnail refresh
-static constexpr int SEPARATOR_HEIGHT = 10;
-static constexpr int PREVIEW_MIN_WIDTH = 280;
-
-// ---------------------------------------------------------------------------
-// Painting helpers
-// ---------------------------------------------------------------------------
-
-// Returns the user's menu font (Segoe UI on modern systems) instead of the
-// legacy DEFAULT_GUI_FONT bitmap font.
-static HFONT GetMenuFont()
+HFONT MenuFont(int dpi)
 {
-    static HFONT font = [] {
-        NONCLIENTMETRICSW ncm = { sizeof(ncm) };
-        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
-            return CreateFontIndirectW(&ncm.lfMenuFont);
+    static int cachedDpi = 0;
+    static HFONT cached = nullptr;
+    if (cached && cachedDpi == dpi)
+        return cached;
+    NONCLIENTMETRICSW metrics{ sizeof(metrics) };
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi))
         return (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    }();
-    return font;
+    if (cached)
+        DeleteObject(cached);
+    cached = CreateFontIndirectW(&metrics.lfMenuFont);
+    cachedDpi = dpi;
+    return cached;
 }
 
-// Alpha-blends a solid colour rectangle onto a 32bpp target DC, preserving the
-// destination's per-pixel alpha semantics (used for tint, hover, separators).
-static void FillAlphaRect(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha)
+// Alpha-blends a solid colour over a 32bpp surface (premultiplied).
+void FillAlpha(HDC hdc, const RECT& rc, COLORREF color, BYTE alpha)
 {
-    BITMAPINFO bmi = {};
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = 1;
-    bmi.bmiHeader.biHeight = 1;
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = 1;
+    info.bmiHeader.biHeight = 1;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
     void* bits = nullptr;
-    HDC srcDC = CreateCompatibleDC(hdc);
-    if (!srcDC) return;
-    HBITMAP bmp = CreateDIBSection(srcDC, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bmp && bits) {
-        // Premultiplied BGRA
-        const BYTE r = (BYTE)((GetRValue(color) * alpha) / 255);
-        const BYTE g = (BYTE)((GetGValue(color) * alpha) / 255);
-        const BYTE b = (BYTE)((GetBValue(color) * alpha) / 255);
-        *(UINT32*)bits = ((UINT32)alpha << 24) | ((UINT32)r << 16) | ((UINT32)g << 8) | b;
-        HGDIOBJ old = SelectObject(srcDC, bmp);
-        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-        AlphaBlend(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, srcDC, 0, 0, 1, 1, bf);
-        SelectObject(srcDC, old);
+    HDC source = CreateCompatibleDC(hdc);
+    HBITMAP pixel = CreateDIBSection(source, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (pixel && bits) {
+        *static_cast<UINT32*>(bits) = ((UINT32)alpha << 24) |
+            ((UINT32)(GetRValue(color) * alpha / 255) << 16) |
+            ((UINT32)(GetGValue(color) * alpha / 255) << 8) |
+            (UINT32)(GetBValue(color) * alpha / 255);
+        HGDIOBJ previous = SelectObject(source, pixel);
+        const BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        AlphaBlend(hdc, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, source, 0, 0, 1, 1, blend);
+        SelectObject(source, previous);
     }
-    if (bmp) DeleteObject(bmp);
-    DeleteDC(srcDC);
+    if (pixel)
+        DeleteObject(pixel);
+    DeleteDC(source);
 }
 
-// Draws alpha-correct text on a composited (per-pixel alpha) surface.
-static void DrawCompositedText(HTHEME theme, HDC hdc, const std::wstring& text, RECT rc, DWORD format, COLORREF color)
+void DrawLabel(HTHEME theme, HDC hdc, const std::wstring& text, RECT rc, DWORD format, COLORREF color)
 {
-    if (theme) {
-        DTTOPTS opts = { sizeof(opts) };
-        opts.dwFlags = DTT_COMPOSITED | DTT_TEXTCOLOR;
-        opts.crText = color;
-        DrawThemeTextEx(theme, hdc, 0, 0, text.c_str(), -1, format | DT_NOPREFIX, &rc, &opts);
-    } else {
-        // Pre-DWM fallback; on a composited surface this text may not show,
-        // but such systems never get this far (the backdrop call fails first).
-        SetTextColor(hdc, color);
-        SetBkMode(hdc, TRANSPARENT);
-        DrawTextW(hdc, text.c_str(), -1, &rc, format | DT_NOPREFIX);
-    }
+    DTTOPTS options{ sizeof(options) };
+    options.dwFlags = DTT_COMPOSITED | DTT_TEXTCOLOR;
+    options.crText = color;
+    DrawThemeTextEx(theme, hdc, 0, 0, text.c_str(), -1, format | DT_NOPREFIX | DT_SINGLELINE | DT_VCENTER, &rc, &options);
 }
 
-// ---------------------------------------------------------------------------
-// Construction / item list
-// ---------------------------------------------------------------------------
-
-CustomMenu::CustomMenu(HWND parent, HINSTANCE instance) : m_hwnd(nullptr), m_parentHwnd(parent), m_instance(instance), m_parentMenu(nullptr), m_activeSubMenu(nullptr), m_activeSubMenuItem(-1), m_handleId(0), m_generation(0) {
-    static bool isClassRegistered = false;
-    if (!isClassRegistered) {
-        InitializeCriticalSection(&g_menuHandleLock);
-        BufferedPaintInit();   // process-lifetime; paired implicitly at exit
-        WNDCLASSEXW wcex = {};
-        wcex.cbSize = sizeof(WNDCLASSEX);
-        wcex.lpfnWndProc = MenuWndProc;
-        wcex.hInstance = m_instance;
-        wcex.lpszClassName = POPUP_MENU_CLASS;
-        wcex.hbrBackground = nullptr;   // we own every painted pixel
-        wcex.style = CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW;
-        wcex.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        RegisterClassExW(&wcex);
-        isClassRegistered = true;
-    }
+int DpiAt(POINT screen)
+{
+    UINT dpiX = 96, dpiY = 96;
+    if (FAILED(GetDpiForMonitor(MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST), MDT_EFFECTIVE_DPI, &dpiX, &dpiY)))
+        return 96;
+    return (int)dpiX;
 }
 
-CustomMenu::~CustomMenu() {
-    UnregisterHandle();
+} // namespace
+
+// -----------------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------------
+
+PopupMenu::PopupMenu(HWND owner, HINSTANCE instance) : m_owner(owner), m_instance(instance)
+{
+    static const bool registered = [instance] {
+        BufferedPaintInit();
+        WNDCLASSEXW wc{ sizeof(wc) };
+        wc.style = CS_DROPSHADOW;
+        wc.lpfnWndProc = WindowProc;
+        wc.hInstance = instance;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = kMenuClass;
+        return RegisterClassExW(&wc) != 0;
+    }();
+    (void)registered;
 }
 
-// Static cleanup for VOM handle table - called at process shutdown
-void CleanupMenuHandles() {
-    EnterCriticalSection(&g_menuHandleLock);
-    for (auto& kv : g_menuHandles) {
-        if (kv.second.CloseEvent) {
-            SetEvent(kv.second.CloseEvent);
-            CloseHandle(kv.second.CloseEvent);
-        }
-    }
-    g_menuHandles.clear();
-    LeaveCriticalSection(&g_menuHandleLock);
-    DeleteCriticalSection(&g_menuHandleLock);
+PopupMenu::~PopupMenu() = default;
+
+void PopupMenu::AddItem(const std::wstring& text, UINT id, bool checked, bool enabled)
+{
+    Item item;
+    item.text = text;
+    item.id = id;
+    item.checked = checked;
+    item.enabled = enabled;
+    m_items.push_back(std::move(item));
 }
 
-void CustomMenu::CleanupHandles() {
-    CleanupMenuHandles();
+void PopupMenu::AddSeparator()
+{
+    if (m_items.empty() || m_items.back().separator)
+        return;
+    Item item;
+    item.separator = true;
+    m_items.push_back(std::move(item));
 }
 
-HWND CustomMenu::GetHwnd() const { return m_hwnd; }
-
-// VOM-style handle registration - allocates a generational handle for the menu
-void CustomMenu::RegisterHandle() {
-    EnterCriticalSection(&g_menuHandleLock);
-    m_handleId = ++g_menuHandleCounter;
-    m_generation = 1;
-    
-    HANDLE closeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    MenuHandleEntry entry{ this, 1, m_generation, closeEvent };
-    g_menuHandles[m_handleId] = entry;
-    LeaveCriticalSection(&g_menuHandleLock);
+PopupMenu* PopupMenu::AddSubMenu(const std::wstring& text)
+{
+    Item item;
+    item.text = text;
+    item.subMenu = std::make_unique<PopupMenu>(m_owner, m_instance);
+    item.subMenu->m_parent = this;
+    PopupMenu* sub = item.subMenu.get();
+    m_items.push_back(std::move(item));
+    return sub;
 }
 
-// Unregister handle and signal close event for deterministic cleanup
-void CustomMenu::UnregisterHandle() {
-    if (m_handleId == 0) return;
-    
-    EnterCriticalSection(&g_menuHandleLock);
-    auto it = g_menuHandles.find(m_handleId);
-    if (it != g_menuHandles.end() && it->second.Menu == this) {
-        // Signal the close event to wake any waiters
-        if (it->second.CloseEvent) {
-            SetEvent(it->second.CloseEvent);
-            CloseHandle(it->second.CloseEvent);
-        }
-        g_menuHandles.erase(it);
-    }
-    m_handleId = 0;
-    LeaveCriticalSection(&g_menuHandleLock);
+bool PopupMenu::IsOpen() { return !g_open.empty(); }
+
+void PopupMenu::CloseAll()
+{
+    if (!g_open.empty() && IsWindow(g_open.front()->m_hwnd))
+        DestroyWindow(g_open.front()->m_hwnd);
 }
 
-// Static helper to signal close event by handle ID
-void CustomMenu::SignalCloseEvent(UINT handleId) {
-    EnterCriticalSection(&g_menuHandleLock);
-    auto it = g_menuHandles.find(handleId);
-    if (it != g_menuHandles.end() && it->second.CloseEvent) {
-        SetEvent(it->second.CloseEvent);
-    }
-    LeaveCriticalSection(&g_menuHandleLock);
+// -----------------------------------------------------------------------------
+// Geometry
+// -----------------------------------------------------------------------------
+
+int PopupMenu::ItemHeight(const Item& item) const
+{
+    if (item.separator)
+        return Scale(kSeparatorHeight, m_dpi);
+    return Scale(kItemHeight, m_dpi);
 }
 
-void CustomMenu::AddItem(const std::wstring& text, UINT id, bool checked) { m_items.push_back({ text, id, false, checked, false, false, nullptr }); }
-void CustomMenu::AddSeparator() { m_items.push_back({ L"", 0, true, false, false, false, nullptr }); }
-
-void CustomMenu::AddPreviewItem(UINT id) {
-    m_items.push_back({ L"", id, false, false, false, true, nullptr });
-    m_hasPreview = true;
-}
-
-void CustomMenu::SetPreviewProvider(MenuPreviewProvider provider) {
-    g_previewProvider = std::move(provider);
-}
-
-CustomMenu* CustomMenu::AddSubMenu(const std::wstring& text) {
-    auto newSubMenu = std::make_unique<CustomMenu>(m_parentHwnd, m_instance);
-    newSubMenu->m_parentMenu = this;
-    CustomMenu* rawPtr = newSubMenu.get();
-    m_items.push_back({ text, 0, false, false, true, false, std::move(newSubMenu) });
-    return rawPtr;
-}
-
-void CustomMenu::CalculateOptimalWidth() {
-    if (m_calculatedWidth > 0) return;
-    HDC hdc = GetDC(NULL);
-    HFONT hOldFont = (HFONT)SelectObject(hdc, GetMenuFont());
-    int maxWidth = 0;
+int PopupMenu::Width() const
+{
+    if (m_width)
+        return m_width;
+    HDC hdc = GetDC(nullptr);
+    HGDIOBJ previous = SelectObject(hdc, MenuFont(m_dpi));
+    int widest = 0;
     for (const auto& item : m_items) {
-        if (!item.isSeparator && !item.isPreview) {
-            SIZE size;
-            if (GetTextExtentPoint32W(hdc, item.text.c_str(), (int)item.text.length(), &size)) {
-                if (size.cx > maxWidth) maxWidth = size.cx;
-            }
-        }
+        SIZE size{};
+        if (!item.separator && GetTextExtentPoint32W(hdc, item.text.c_str(), (int)item.text.size(), &size))
+            widest = std::max(widest, (int)size.cx);
     }
-    SelectObject(hdc, hOldFont);
-    ReleaseDC(NULL, hdc);
-    m_calculatedWidth = maxWidth + 85;
-    if (m_hasPreview && m_calculatedWidth < PREVIEW_MIN_WIDTH)
-        m_calculatedWidth = PREVIEW_MIN_WIDTH;
+    SelectObject(hdc, previous);
+    ReleaseDC(nullptr, hdc);
+    m_width = widest + Scale(84, m_dpi);
+    return m_width;
 }
 
-int CustomMenu::ItemHeight(const CustomMenuItem& item) const {
-    if (item.isSeparator) return SEPARATOR_HEIGHT;
-    if (item.isPreview) {
-        // 16:9 thumbnail spanning the menu width, plus padding.
-        const int innerW = m_calculatedWidth - 16;
-        return innerW * 9 / 16 + 12;
-    }
-    return m_itemHeight;
-}
-
-int CustomMenu::GetCalculatedWidth() const {
-    const_cast<CustomMenu*>(this)->CalculateOptimalWidth();
-    return m_calculatedWidth;
-}
-
-int CustomMenu::GetCalculatedHeight() const {
-    GetCalculatedWidth();   // preview height depends on the width
-    int height = 0;
+int PopupMenu::Height() const
+{
+    int height = Scale(4, m_dpi) * 2;
     for (const auto& item : m_items)
         height += ItemHeight(item);
     return height;
 }
 
-// ---------------------------------------------------------------------------
-// Window lifetime
-// ---------------------------------------------------------------------------
-
-void CustomMenu::Show(int x, int y) {
-    CalculateOptimalWidth();
-    int height = GetCalculatedHeight();
-
-    m_hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        POPUP_MENU_CLASS, L"", WS_POPUP,
-        x, y, m_calculatedWidth, height,
-        m_parentMenu ? m_parentMenu->m_hwnd : m_parentHwnd,
-        nullptr, m_instance, this
-    );
-    if (!m_hwnd) return;
-
-    // Register VOM-style handle for deterministic cleanup tracking
-    RegisterHandle();
-    
-    g_openMenus.push_back(this);
-    if (m_parentMenu == nullptr) {
-        g_topLevelMenu = this;
-        SetCapture(m_hwnd);
-    }
-
-    // Extend the frame over the whole client area so the system backdrop is
-    // visible wherever we leave alpha at zero; then request the Acrylic-style
-    // transient-window backdrop, dark mode, and rounded corners.
-    MARGINS margins = { -1, -1, -1, -1 };
-    DwmExtendFrameIntoClientArea(m_hwnd, &margins);
-    DWM_SYSTEMBACKDROP_TYPE backdropType = DWMSBT_TRANSIENTWINDOW;
-    DwmSetWindowAttribute(m_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdropType, sizeof(backdropType));
-    BOOL useDarkMode = TRUE;
-    DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &useDarkMode, sizeof(useDarkMode));
-    DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUNDSMALL;
-    DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-
-    if (m_hasPreview)
-        SetTimer(m_hwnd, PREVIEW_TIMER_ID, PREVIEW_TIMER_MS, nullptr);
-
-    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+RECT PopupMenu::ItemRect(size_t index) const
+{
+    int top = Scale(4, m_dpi);
+    for (size_t i = 0; i < index; i++)
+        top += ItemHeight(m_items[i]);
+    return { 0, top, Width(), top + ItemHeight(m_items[index]) };
 }
 
-void CustomMenu::CloseChildren() {
-    if (m_activeSubMenu) {
-        if (IsWindow(m_activeSubMenu->m_hwnd)) {
-            DestroyWindow(m_activeSubMenu->m_hwnd);
-        }
-        m_activeSubMenu = nullptr;
-        m_activeSubMenuItem = -1;
+int PopupMenu::HitTest(POINT client) const
+{
+    for (size_t i = 0; i < m_items.size(); i++) {
+        const RECT rc = ItemRect(i);
+        if (PtInRect(&rc, client))
+            return m_items[i].separator ? -1 : (int)i;
     }
+    return -1;
 }
 
-void CustomMenu::CloseAllMenus() {
-    if (g_topLevelMenu && IsWindow(g_topLevelMenu->m_hwnd)) {
-        DestroyWindow(g_topLevelMenu->m_hwnd);
-    }
+// -----------------------------------------------------------------------------
+// Showing and submenus
+// -----------------------------------------------------------------------------
+
+void PopupMenu::ShowAt(POINT anchor)
+{
+    CloseAll();
+    m_dpi = DpiAt(anchor);
+    MONITORINFO monitor{ sizeof(monitor) };
+    GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &monitor);
+    int x = anchor.x, y = anchor.y;
+    if (x + Width() > monitor.rcWork.right) x = anchor.x - Width();
+    if (y + Height() > monitor.rcWork.bottom) y = anchor.y - Height();
+    // Tray menus must own the foreground so a click elsewhere dismisses them.
+    SetForegroundWindow(m_owner);
+    Show(x, y);
 }
 
-LRESULT CALLBACK CustomMenu::MenuWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    CustomMenu* pThis = (CustomMenu*)GetWindowLongPtr(hWnd, GWLP_USERDATA);
-    if (uMsg == WM_NCCREATE) {
-        CREATESTRUCT* pCreate = (CREATESTRUCT*)lParam;
-        pThis = (CustomMenu*)pCreate->lpCreateParams;
-        SetWindowLongPtr(hWnd, GWLP_USERDATA, (LONG_PTR)pThis);
-    }
-    if (pThis) {
-        return pThis->HandleMessage(hWnd, uMsg, wParam, lParam);
-    }
-    return DefWindowProc(hWnd, uMsg, wParam, lParam);
-}
-
-void CustomMenu::HandleMouseMove(POINT clientPt) {
-    int y = clientPt.y;
-    int currentY = 0;
-    int newHover = -1;
-
-    for (size_t i = 0; i < m_items.size(); ++i) {
-        int itemHeight = ItemHeight(m_items[i]);
-        RECT itemRect = { 0, currentY, m_calculatedWidth, currentY + itemHeight };
-        if (y >= itemRect.top && y < itemRect.bottom && !m_items[i].isSeparator) {
-            newHover = (int)i;
-            break;
-        }
-        currentY += itemHeight;
-    }
-
-    if (newHover != m_hoverItem) {
-        if (m_activeSubMenuItem != -1 && m_activeSubMenuItem != newHover) {
-            CloseChildren();
-        }
-
-        m_hoverItem = newHover;
-        InvalidateRect(m_hwnd, NULL, FALSE);
-
-        if (m_hoverItem != -1 && m_items[m_hoverItem].isSubMenu && !m_activeSubMenu) {
-            m_activeSubMenuItem = m_hoverItem;
-            m_activeSubMenu = m_items[m_hoverItem].subMenu.get();
-
-            RECT rcItem;
-            GetClientRect(m_hwnd, &rcItem);
-            int itemTop = 0;
-            for (int i = 0; i < m_hoverItem; ++i) {
-                itemTop += ItemHeight(m_items[i]);
-            }
-            rcItem.top = itemTop;
-            rcItem.bottom = rcItem.top + m_itemHeight;
-            ClientToScreen(m_hwnd, (POINT*)&rcItem.left);
-            ClientToScreen(m_hwnd, (POINT*)&rcItem.right);
-
-            m_activeSubMenu->CalculateOptimalWidth();
-            int subMenuW = m_activeSubMenu->m_calculatedWidth;
-            int subMenuH = m_activeSubMenu->GetCalculatedHeight();
-
-            HMONITOR hMonitor = MonitorFromRect(&rcItem, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi = { sizeof(mi) }; GetMonitorInfo(hMonitor, &mi);
-
-            int x = rcItem.right - 5;
-            if (x + subMenuW > mi.rcWork.right) x = rcItem.left - subMenuW;
-            int yPos = rcItem.top;
-            if (yPos + subMenuH > mi.rcWork.bottom) yPos = rcItem.bottom - subMenuH;
-
-            m_activeSubMenu->Show(x, yPos);
-        }
-    }
-}
-
-LRESULT CustomMenu::HandleMessage(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    switch (uMsg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        // Paint through a 32bpp buffered-paint DIB so per-pixel alpha reaches
-        // DWM: pixels left at alpha 0 show the Mica/Acrylic backdrop.
-        RECT rcClient;
-        GetClientRect(hWnd, &rcClient);
-        HDC memDC = nullptr;
-        HPAINTBUFFER pb = BeginBufferedPaint(hdc, &rcClient, BPBF_TOPDOWNDIB, nullptr, &memDC);
-        if (pb && memDC) {
-            BufferedPaintClear(pb, nullptr);
-            Draw(memDC, pb);
-            EndBufferedPaint(pb, TRUE);
-        } else {
-            Draw(hdc, nullptr);   // degraded path: opaque, but functional
-        }
-        EndPaint(hWnd, &ps);
-        return 0;
-    }
-
-    case WM_ERASEBKGND:
-        return 1;   // all painting happens in WM_PAINT
-
-    case WM_TIMER: {
-        if (wParam == PREVIEW_TIMER_ID) {
-            InvalidateRect(hWnd, NULL, FALSE);
-        }
-        return 0;
-    }
-
-    case WM_MOUSEMOVE: {
-        POINT clientPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        if (m_parentMenu == nullptr) {
-            POINT screenPt = clientPt;
-            ClientToScreen(hWnd, &screenPt);
-
-            CustomMenu* targetMenu = nullptr;
-            for (auto it = g_openMenus.rbegin(); it != g_openMenus.rend(); ++it) {
-                CustomMenu* pMenu = *it;
-                RECT rc; GetWindowRect(pMenu->GetHwnd(), &rc);
-                if (PtInRect(&rc, screenPt)) {
-                    targetMenu = pMenu;
-                    break;
-                }
-            }
-
-            for (auto* pMenu : g_openMenus) {
-                bool isAncestor = false;
-                CustomMenu* temp = targetMenu;
-                while (temp) {
-                    if (temp == pMenu) { isAncestor = true; break; }
-                    temp = temp->m_parentMenu;
-                }
-                if (pMenu != targetMenu && !isAncestor) {
-                    if (pMenu->m_hoverItem != -1) {
-                        pMenu->m_hoverItem = -1;
-                        InvalidateRect(pMenu->GetHwnd(), NULL, FALSE);
-                    }
-                    pMenu->CloseChildren();
-                }
-            }
-
-            if (targetMenu) {
-                POINT targetClientPt = screenPt;
-                ScreenToClient(targetMenu->GetHwnd(), &targetClientPt);
-                targetMenu->HandleMouseMove(targetClientPt);
-            }
-        } else {
-            HandleMouseMove(clientPt);
-        }
-        return 0;
-    }
-
-    case WM_KILLFOCUS: {
-        // User focus shifted away - trigger deterministic cleanup via handle event
-        if (this == g_topLevelMenu) {
-            CloseAllMenus();
-        }
-        return 0;
-    }
-
-    case WM_CAPTURECHANGED:
-    case WM_ACTIVATE: {
-        if (this == g_topLevelMenu && uMsg == WM_ACTIVATE && wParam == WA_INACTIVE) {
-            CloseAllMenus();
-        } else if (uMsg == WM_CAPTURECHANGED && (HWND)lParam != m_hwnd) {
-            CloseAllMenus();
-        }
-        return 0;
-    }
-
-    case WM_LBUTTONDOWN: {
-        if (this != g_topLevelMenu) {
-            return DefWindowProc(hWnd, uMsg, wParam, lParam);
-        }
-
-        POINT screenPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        ClientToScreen(hWnd, &screenPt);
-
-        CustomMenu* targetMenu = nullptr;
-        for (auto it = g_openMenus.rbegin(); it != g_openMenus.rend(); ++it) {
-            CustomMenu* pMenu = *it;
-            if (!pMenu || !IsWindow(pMenu->m_hwnd)) continue;
-            RECT rc;
-            GetWindowRect(pMenu->m_hwnd, &rc);
-            if (PtInRect(&rc, screenPt)) {
-                targetMenu = pMenu;
-                break;
-            }
-        }
-
-        if (targetMenu) {
-            POINT clientPt = screenPt;
-            ScreenToClient(targetMenu->m_hwnd, &clientPt);
-
-            UINT commandId = 0;
-            int currentY = 0;
-            for (const auto& item : targetMenu->m_items) {
-                int itemHeight = targetMenu->ItemHeight(item);
-                RECT itemRect = { 0, currentY, targetMenu->m_calculatedWidth, currentY + itemHeight };
-
-                if (!item.isSeparator && !item.isSubMenu) {
-                    if (PtInRect(&itemRect, clientPt)) {
-                        commandId = item.id;
-                        break;
-                    }
-                }
-                currentY += itemHeight;
-            }
-
-            if (commandId != 0) {
-                SendMessage(m_parentHwnd, WM_APP_MENU_COMMAND, commandId, 0);
-            }
-        }
-
-        CloseAllMenus();
-        return 0;
-    }
-
-    case WM_DESTROY: {
-        KillTimer(hWnd, PREVIEW_TIMER_ID);
-        if (this == g_topLevelMenu) {
-            ReleaseCapture();
-            g_topLevelMenu = nullptr;
-        }
-        // Detach from the parent so it never dereferences a destroyed submenu.
-        if (m_parentMenu && m_parentMenu->m_activeSubMenu == this) {
-            m_parentMenu->m_activeSubMenu = nullptr;
-            m_parentMenu->m_activeSubMenuItem = -1;
-        }
-
-        auto it = std::find(g_openMenus.begin(), g_openMenus.end(), this);
-        if (it != g_openMenus.end()) {
-            g_openMenus.erase(it);
-        }
-        m_hwnd = nullptr;
-        SetWindowLongPtr(hWnd, GWLP_USERDATA, 0);
-        
-        // Unregister VOM handle to signal deterministic cleanup
-        UnregisterHandle();
-        return 0;
-    }
-
-    case WM_NCDESTROY: {
-        // Only the top-level menu owns itself; submenu objects belong to their
-        // parent's unique_ptr and are deleted with the parent.
-        if (m_parentMenu == nullptr) {
+void PopupMenu::Show(int x, int y)
+{
+    m_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, kMenuClass, L"", WS_POPUP,
+                             x, y, Width(), Height(), m_parent ? m_parent->m_hwnd : m_owner, nullptr, m_instance, this);
+    if (!m_hwnd) {
+        if (!m_parent)
             delete this;
-        }
-        return 0;
+        return;
     }
-    
-    default:
-        return DefWindowProc(hWnd, uMsg, wParam, lParam);
+
+    const MARGINS margins{ -1, -1, -1, -1 };
+    DwmExtendFrameIntoClientArea(m_hwnd, &margins);
+    const DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_TABBEDWINDOW;   // Mica Alt
+    DwmSetWindowAttribute(m_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof(backdrop));
+    const BOOL dark = TRUE;
+    DwmSetWindowAttribute(m_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    const DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+    DwmSetWindowAttribute(m_hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof(corners));
+
+    g_open.push_back(this);
+    ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+    if (!m_parent)
+        SetCapture(m_hwnd);
+}
+
+void PopupMenu::OpenSubMenu(int index)
+{
+    CloseSubMenu();
+    PopupMenu* sub = m_items[index].subMenu.get();
+    if (!sub || sub->m_items.empty())
+        return;
+    sub->m_dpi = m_dpi;
+    RECT item = ItemRect(index);
+    MapWindowPoints(m_hwnd, nullptr, reinterpret_cast<POINT*>(&item), 2);
+    MONITORINFO monitor{ sizeof(monitor) };
+    GetMonitorInfoW(MonitorFromRect(&item, MONITOR_DEFAULTTONEAREST), &monitor);
+    int x = item.right - Scale(4, m_dpi);
+    if (x + sub->Width() > monitor.rcWork.right)
+        x = item.left - sub->Width() + Scale(4, m_dpi);
+    int y = item.top - Scale(4, m_dpi);
+    if (y + sub->Height() > monitor.rcWork.bottom)
+        y = std::max<int>(monitor.rcWork.top, monitor.rcWork.bottom - sub->Height());
+    m_openSub = sub;
+    sub->Show(x, y);
+}
+
+void PopupMenu::CloseSubMenu()
+{
+    if (m_openSub && IsWindow(m_openSub->m_hwnd))
+        DestroyWindow(m_openSub->m_hwnd);
+    m_openSub = nullptr;
+}
+
+void PopupMenu::Hover(int index)
+{
+    if (index == m_hover)
+        return;
+    m_hover = index;
+    InvalidateRect(m_hwnd, nullptr, FALSE);
+    if (index >= 0 && m_items[index].subMenu) {
+        if (m_openSub != m_items[index].subMenu.get())
+            OpenSubMenu(index);
+    } else {
+        CloseSubMenu();
     }
 }
 
-// ---------------------------------------------------------------------------
-// Drawing
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Painting
+// -----------------------------------------------------------------------------
 
-void CustomMenu::Draw(HDC hdc, HANDLE paintBuffer) {
-    RECT clientRect;
-    GetClientRect(m_hwnd, &clientRect);
-
-    // Faint dark tint over the backdrop for legibility on bright desktops.
-    FillAlphaRect(hdc, clientRect, RGB(18, 18, 22), 130);
+void PopupMenu::Paint(HDC hdc)
+{
+    RECT client;
+    GetClientRect(m_hwnd, &client);
+    // Faint tint keeps text legible on bright wallpapers.
+    FillAlpha(hdc, client, RGB(18, 18, 22), 110);
 
     HTHEME theme = OpenThemeData(m_hwnd, L"CompositedWindow::Window");
-    HFONT oldFont = (HFONT)SelectObject(hdc, GetMenuFont());
+    HGDIOBJ previousFont = SelectObject(hdc, MenuFont(m_dpi));
+    const int pad = Scale(4, m_dpi);
 
-    int currentY = 0;
-    for (size_t i = 0; i < m_items.size(); ++i) {
-        const auto& item = m_items[i];
-        int itemHeight = ItemHeight(item);
-        RECT itemRect = { 0, currentY, m_calculatedWidth, currentY + itemHeight };
-
-        if (item.isSeparator) {
-            RECT sepRect = itemRect;
-            sepRect.top += 4; sepRect.bottom = sepRect.top + 1;
-            sepRect.left += 10; sepRect.right -= 10;
-            FillAlphaRect(hdc, sepRect, RGB(255, 255, 255), 40);
-        } else if (item.isPreview) {
-            RECT box = itemRect;
-            InflateRect(&box, -8, -6);
-            // Plate behind the video (also the "letterbox" colour).
-            FillAlphaRect(hdc, box, RGB(0, 0, 0), 110);
-
-            std::vector<uint32_t> frame;
-            UINT fw = 0, fh = 0;
-            if (g_previewProvider && g_previewProvider(frame, fw, fh) && fw && fh) {
-                const int boxW = box.right - box.left, boxH = box.bottom - box.top;
-                const float fit = std::min(boxW / (float)fw, boxH / (float)fh);
-                const int dw = std::max(1, (int)(fw * fit));
-                const int dh = std::max(1, (int)(fh * fit));
-                const int dx = box.left + (boxW - dw) / 2;
-                const int dy = box.top + (boxH - dh) / 2;
-
-                BITMAPINFO bmi = {};
-                bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-                bmi.bmiHeader.biWidth = (LONG)fw;
-                bmi.bmiHeader.biHeight = -(LONG)fh;   // top-down
-                bmi.bmiHeader.biPlanes = 1;
-                bmi.bmiHeader.biBitCount = 32;
-                SetStretchBltMode(hdc, HALFTONE);
-                SetBrushOrgEx(hdc, 0, 0, nullptr);
-                StretchDIBits(hdc, dx, dy, dw, dh, 0, 0, fw, fh, frame.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
-
-                // StretchDIBits writes alpha 0; restore opacity so DWM doesn't
-                // blend the backdrop through the video.
-                RGBQUAD* bits = nullptr;
-                int rowPx = 0;
-                if (paintBuffer && SUCCEEDED(GetBufferedPaintBits((HPAINTBUFFER)paintBuffer, &bits, &rowPx)) && bits) {
-                    for (int y = dy; y < dy + dh && y < clientRect.bottom; y++)
-                        for (int x = dx; x < dx + dw && x < clientRect.right; x++)
-                            bits[(size_t)y * rowPx + x].rgbReserved = 255;
-                }
-            } else {
-                DrawCompositedText(theme, hdc, L"Preview unavailable", box, DT_SINGLELINE | DT_VCENTER | DT_CENTER, RGB(160, 160, 160));
-            }
-        } else {
-            if ((int)i == m_hoverItem) {
-                RECT hoverRect = itemRect;
-                InflateRect(&hoverRect, -4, -2);
-                FillAlphaRect(hdc, hoverRect, RGB(255, 255, 255), 28);
-            }
-
-            RECT textRect = itemRect;
-            textRect.left += 35;
-            DrawCompositedText(theme, hdc, item.text, textRect, DT_SINGLELINE | DT_VCENTER, RGB(240, 240, 240));
-            if (item.isChecked) {
-                RECT checkRect = itemRect;
-                checkRect.right = 30;
-                DrawCompositedText(theme, hdc, L"\u2713", checkRect, DT_SINGLELINE | DT_VCENTER | DT_CENTER, RGB(240, 240, 240));
-            }
-            if (item.isSubMenu) {
-                RECT arrowRect = itemRect;
-                arrowRect.left = m_calculatedWidth - 30;
-                arrowRect.right = m_calculatedWidth - 10;
-                DrawCompositedText(theme, hdc, L"\u203A", arrowRect, DT_SINGLELINE | DT_VCENTER | DT_CENTER, RGB(200, 200, 200));
-            }
+    for (size_t i = 0; i < m_items.size(); i++) {
+        const Item& item = m_items[i];
+        RECT rc = ItemRect(i);
+        if (item.separator) {
+            RECT line{ rc.left + Scale(12, m_dpi), (rc.top + rc.bottom) / 2, rc.right - Scale(12, m_dpi), (rc.top + rc.bottom) / 2 + 1 };
+            FillAlpha(hdc, line, RGB(255, 255, 255), 36);
+            continue;
         }
-        currentY += itemHeight;
+        if ((int)i == m_hover && item.enabled) {
+            RECT highlight = rc;
+            InflateRect(&highlight, -pad, -Scale(2, m_dpi));
+            FillAlpha(hdc, highlight, RGB(255, 255, 255), 26);
+        }
+        const COLORREF color = item.enabled ? RGB(240, 240, 240) : RGB(130, 130, 136);
+        RECT text = rc;
+        text.left += Scale(36, m_dpi);
+        text.right -= Scale(28, m_dpi);
+        DrawLabel(theme, hdc, item.text, text, DT_END_ELLIPSIS, color);
+        if (item.checked) {
+            RECT check{ rc.left + Scale(8, m_dpi), rc.top, rc.left + Scale(30, m_dpi), rc.bottom };
+            DrawLabel(theme, hdc, L"✓", check, DT_CENTER, color);
+        }
+        if (item.subMenu) {
+            RECT arrow{ rc.right - Scale(28, m_dpi), rc.top, rc.right - Scale(10, m_dpi), rc.bottom };
+            DrawLabel(theme, hdc, L"›", arrow, DT_CENTER, RGB(200, 200, 200));
+        }
     }
 
-    SelectObject(hdc, oldFont);
-    if (theme) CloseThemeData(theme);
+    SelectObject(hdc, previousFont);
+    if (theme)
+        CloseThemeData(theme);
 }
 
+// -----------------------------------------------------------------------------
+// Window procedure
+// -----------------------------------------------------------------------------
+
+LRESULT CALLBACK PopupMenu::WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_NCCREATE) {
+        auto* self = static_cast<PopupMenu*>(reinterpret_cast<CREATESTRUCTW*>(lParam)->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        self->m_hwnd = hwnd;
+    }
+    auto* self = reinterpret_cast<PopupMenu*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    return self ? self->HandleMessage(message, wParam, lParam) : DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+LRESULT PopupMenu::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam)
+{
+    // Screen point -> (deepest open menu under it, client point).
+    auto route = [](POINT screen, POINT& client) -> PopupMenu* {
+        for (auto it = g_open.rbegin(); it != g_open.rend(); ++it) {
+            RECT rc;
+            GetWindowRect((*it)->m_hwnd, &rc);
+            if (PtInRect(&rc, screen)) {
+                client = screen;
+                ScreenToClient((*it)->m_hwnd, &client);
+                return *it;
+            }
+        }
+        return nullptr;
+    };
+
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(m_hwnd, &ps);
+        RECT client;
+        GetClientRect(m_hwnd, &client);
+        HDC buffer = nullptr;
+        HPAINTBUFFER paint = BeginBufferedPaint(hdc, &client, BPBF_TOPDOWNDIB, nullptr, &buffer);
+        if (paint) {
+            BufferedPaintClear(paint, nullptr);
+            Paint(buffer);
+            EndBufferedPaint(paint, TRUE);
+        }
+        EndPaint(m_hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_MOUSEMOVE: {
+        if (m_parent)
+            break;   // only the root (capture holder) routes input
+        POINT screen{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ClientToScreen(m_hwnd, &screen);
+        POINT client{};
+        if (PopupMenu* target = route(screen, client))
+            target->Hover(target->HitTest(client));
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (m_parent)
+            break;
+        POINT screen{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ClientToScreen(m_hwnd, &screen);
+        POINT client{};
+        PopupMenu* target = route(screen, client);
+        if (target) {
+            const int index = target->HitTest(client);
+            if (index < 0 || target->m_items[index].subMenu || !target->m_items[index].enabled)
+                return 0;   // separators, submenu headers, disabled items keep the menu open
+            const UINT id = target->m_items[index].id;
+            const HWND owner = m_owner;
+            CloseAll();
+            PostMessageW(owner, WM_APP_MENU_COMMAND, id, 0);
+            return 0;
+        }
+        CloseAll();
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN: {
+        if (m_parent)
+            break;
+        POINT screen{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ClientToScreen(m_hwnd, &screen);
+        POINT client{};
+        if (!route(screen, client))
+            CloseAll();   // click outside every menu
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE)
+            CloseAll();
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (!m_parent && reinterpret_cast<HWND>(lParam) != m_hwnd)
+            CloseAll();
+        return 0;
+
+    case WM_DESTROY: {
+        CloseSubMenu();
+        if (m_parent && m_parent->m_openSub == this)
+            m_parent->m_openSub = nullptr;
+        g_open.erase(std::remove(g_open.begin(), g_open.end(), this), g_open.end());
+        if (!m_parent && GetCapture() == m_hwnd)
+            ReleaseCapture();
+        m_hover = -1;
+        return 0;
+    }
+    case WM_NCDESTROY: {
+        SetWindowLongPtrW(m_hwnd, GWLP_USERDATA, 0);
+        m_hwnd = nullptr;
+        // The root owns itself; submenus belong to their parent item.
+        if (!m_parent)
+            delete this;
+        return 0;
+    }
+    }
+    return DefWindowProcW(m_hwnd, message, wParam, lParam);
+}

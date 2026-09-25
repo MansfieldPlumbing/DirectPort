@@ -10,7 +10,7 @@
 //  - Multiplexer produces composited grid as shared stream (DirectPort_Tex_Multiplexer)
 //  - Non-blocking UDP discovery beacon (3-second cadence, loopback zero-prompt default)
 //  - GPU hardware crossbar fence wait (ID3D12CommandQueue::Wait, ~170ns latency)
-//  - Event-driven waitable swapchain pump with zero polling thrash
+//  - Waitable swapchain pump; camera and audio are callback/event driven
 //  - Embedded HLSL fallback shaders (never fails to render, no black screens)
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -218,8 +218,11 @@ static auto                           g_producerStartTime = std::chrono::steady_
 // --- Camera Staging Resources ---
 static ComPtr<ID3D12Resource>         g_cameraTexture;
 static ComPtr<ID3D12DescriptorHeap>   g_cameraSrvHeap;
-static ComPtr<ID3D12Resource>         g_cameraUploadBuffer;
-static UINT8*                         g_pCameraUploadData = nullptr;
+// One upload buffer per frame in flight: the CPU never overwrites a buffer
+// the GPU may still be copying from.
+static ComPtr<ID3D12Resource>         g_cameraUploadBuffer[kFrameCount];
+static UINT8*                         g_pCameraUploadData[kFrameCount] = {};
+static UINT64                         g_cameraFrameSerial = 0;
 static UINT                           g_cameraUploadSize = 0;
 static UINT                           g_cameraRowPitch = 0;
 
@@ -266,6 +269,8 @@ static HANDLE                         g_hMuxManifestOut = nullptr;
 static BroadcastManifest*             g_pMuxManifestViewOut = nullptr;
 static HANDLE                         g_muxSharedOutTexHandle = nullptr;
 static HANDLE                         g_muxSharedOutFenceHandle = nullptr;
+static std::wstring                   g_muxTexName;
+static std::wstring                   g_muxFenceName;
 
 // --- Networking & Audio Services ---
 static DirectPortDiscoveryBroadcaster g_broadcaster;
@@ -308,6 +313,8 @@ void StepGraph_InputAcquire();
 void StepGraph_Composition(float totalW, float totalH);
 void StepGraph_PresentAndSync();
 void MoveToNextFrame();
+void WaitForGpu();
+void ResizeSwapChain(UINT width, UINT height);
 void Cleanup();
 void StartAudioPlayback();
 void StopAudioPlayback();
@@ -469,46 +476,30 @@ void ManageTrayIcon(HWND hwnd, bool add) {
 }
 
 void ShowContextMenu(HWND hwnd, POINT pt) {
-    SetForegroundWindow(hwnd);
-
-    auto* menu = new CustomMenu(hwnd, g_instance);
-    menu->AddItem(L"Producer: Procedural Shader\tF1", IDM_MODE_SHADER, g_mode == MODE_PRODUCER_SHADER);
-    menu->AddItem(L"Producer: Live Camera Feed\tF2", IDM_MODE_CAMERA, g_mode == MODE_PRODUCER_CAMERA);
-    menu->AddItem(L"Consumer: Auto-Listen Stream\tF3", IDM_MODE_CONSUMER, g_mode == MODE_CONSUMER);
-    menu->AddItem(L"Multiplexer: 256-Camera Blueprint\tF4", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
+    auto* menu = new PopupMenu(hwnd, g_instance);
+    menu->AddItem(L"Producer: procedural shader  (F1)", IDM_MODE_SHADER, g_mode == MODE_PRODUCER_SHADER);
+    menu->AddItem(L"Producer: live camera  (F2)", IDM_MODE_CAMERA, g_mode == MODE_PRODUCER_CAMERA);
+    menu->AddItem(L"Consumer: auto-listen  (F3)", IDM_MODE_CONSUMER, g_mode == MODE_CONSUMER);
+    menu->AddItem(L"Multiplexer: grid of all streams  (F4)", IDM_MODE_MULTIPLEXER, g_mode == MODE_MULTIPLEXER);
     menu->AddSeparator();
 
-    // Enumerate cameras and add to menu
     auto cams = DirectPortCameraCapture::EnumerateCameras();
     if (!cams.empty()) {
+        PopupMenu* cameras = menu->AddSubMenu(L"Camera");
         for (const auto& c : cams) {
-            std::wstring camItem = L"Camera: " + c.friendlyName;
-            bool active = (g_mode == MODE_PRODUCER_CAMERA && g_cameraDeviceIndex == c.index);
-            menu->AddItem(camItem, IDM_CAMERA_SELECT_BASE + c.index, active);
+            const bool active = (g_mode == MODE_PRODUCER_CAMERA && g_cameraDeviceIndex == c.index);
+            cameras->AddItem(c.friendlyName, IDM_CAMERA_SELECT_BASE + c.index, active);
         }
-        menu->AddItem(L"Cycle Next Camera\tC", IDM_CYCLE_CAMERA, false);
-        menu->AddSeparator();
+        cameras->AddSeparator();
+        cameras->AddItem(L"Next camera  (C)", IDM_CYCLE_CAMERA);
     }
 
-    menu->AddItem(L"Reload HLSL Shader\tF5", IDM_RELOAD_SHADER, false);
-    menu->AddItem(L"WASAPI Audio Crossbar\tM", IDM_TOGGLE_AUDIO, g_enableAudio);
+    menu->AddItem(L"Reload HLSL shader  (F5)", IDM_RELOAD_SHADER);
+    menu->AddItem(L"Audio  (M)", IDM_TOGGLE_AUDIO, g_enableAudio);
     menu->AddSeparator();
-    menu->AddItem(IsWindowVisible(hwnd) ? L"Hide Window" : L"Show Window", IDM_SHOW_HIDE_WINDOW, false);
-    menu->AddItem(L"Exit DirectPort\tEsc", IDM_EXIT, false);
-
-    int menuWidth = menu->GetCalculatedWidth();
-    int menuHeight = menu->GetCalculatedHeight();
-
-    HMONITOR hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi = { sizeof(mi) };
-    GetMonitorInfo(hMonitor, &mi);
-
-    int x = pt.x;
-    int y = pt.y;
-    if (x + menuWidth > mi.rcWork.right) x = pt.x - menuWidth;
-    if (y + menuHeight > mi.rcWork.bottom) y = pt.y - menuHeight;
-
-    menu->Show(x, y);
+    menu->AddItem(IsWindowVisible(hwnd) ? L"Hide window" : L"Show window", IDM_SHOW_HIDE_WINDOW);
+    menu->AddItem(L"Exit", IDM_EXIT);
+    menu->ShowAt(pt);
 }
 
 bool InitD3D12(HWND hwnd) {
@@ -603,6 +594,11 @@ bool InitD3D12(HWND hwnd) {
 
     g_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_renderFence));
     g_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    // The first frame's fence value must be non-zero, otherwise the first
+    // MoveToNextFrame() records 0 for a buffer and its allocator is later
+    // reset while the GPU may still be using it.
+    g_frameIndex = g_swapChain->GetCurrentBackBufferIndex();
+    g_fenceValues[g_frameIndex] = 1;
 
     D3D12_HEAP_PROPERTIES uploadHeap = { D3D12_HEAP_TYPE_UPLOAD };
     D3D12_RESOURCE_DESC cbDesc = {};
@@ -752,8 +748,10 @@ bool InitProducerSharedResources() {
     ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;AU)", SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr);
 
     DWORD pid = GetCurrentProcessId();
-    g_texHandleName = L"Global\\DirectPortTexture_" + std::to_wstring(pid);
-    g_fenceHandleName = L"Global\\DirectPortFence_" + std::to_wstring(pid);
+    // Local\ (session) names: Global\ needs SeCreateGlobalPrivilege, which
+    // standard users do not have, so CreateSharedHandle would fail for them.
+    g_texHandleName = L"Local\\DirectPortTexture_" + std::to_wstring(pid);
+    g_fenceHandleName = L"Local\\DirectPortFence_" + std::to_wstring(pid);
 
     g_device->CreateSharedHandle(g_producerSharedTexture.Get(), &sa, GENERIC_ALL, g_texHandleName.c_str(), &g_producerSharedTexHandle);
     g_device->CreateSharedHandle(g_producerSharedFence.Get(), &sa, GENERIC_ALL, g_fenceHandleName.c_str(), &g_producerSharedFenceHandle);
@@ -838,20 +836,24 @@ bool InitCameraResources() {
     upDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
     D3D12_HEAP_PROPERTIES upHeap = { D3D12_HEAP_TYPE_UPLOAD };
-    if (FAILED(g_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &upDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cameraUploadBuffer)))) return false;
-
-    g_cameraUploadBuffer->Map(0, nullptr, reinterpret_cast<void**>(&g_pCameraUploadData));
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (FAILED(g_device->CreateCommittedResource(&upHeap, D3D12_HEAP_FLAG_NONE, &upDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&g_cameraUploadBuffer[i])))) return false;
+        g_cameraUploadBuffer[i]->Map(0, nullptr, reinterpret_cast<void**>(&g_pCameraUploadData[i]));
+    }
+    g_cameraFrameSerial = 0;
     return true;
 }
 
 void TeardownCameraResources() {
     g_cameraCapture.Shutdown();
-    if (g_pCameraUploadData) {
-        g_cameraUploadBuffer->Unmap(0, nullptr);
-        g_pCameraUploadData = nullptr;
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (g_pCameraUploadData[i]) {
+            g_cameraUploadBuffer[i]->Unmap(0, nullptr);
+            g_pCameraUploadData[i] = nullptr;
+        }
+        g_cameraUploadBuffer[i].Reset();
     }
-    g_cameraUploadBuffer.Reset();
     g_cameraTexture.Reset();
     g_cameraUploadSize = 0;
     g_cameraRowPitch = 0;
@@ -900,8 +902,10 @@ bool InitMuxResources() {
     sa.lpSecurityDescriptor = sd;
 
     DWORD pid = GetCurrentProcessId();
-    std::wstring textureName = L"Global\\DirectPortTexture_Multiplexer_" + std::to_wstring(pid);
-    std::wstring fenceName = L"Global\\DirectPortFence_Multiplexer_" + std::to_wstring(pid);
+    g_muxTexName = L"Local\\DirectPortTexture_Multiplexer_" + std::to_wstring(pid);
+    g_muxFenceName = L"Local\\DirectPortFence_Multiplexer_" + std::to_wstring(pid);
+    const std::wstring& textureName = g_muxTexName;
+    const std::wstring& fenceName = g_muxFenceName;
     g_device->CreateSharedHandle(g_muxSharedOutTexture.Get(), &sa, GENERIC_ALL, textureName.c_str(), &g_muxSharedOutTexHandle);
     g_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&g_muxSharedOutFence));
     g_device->CreateSharedHandle(g_muxSharedOutFence.Get(), &sa, GENERIC_ALL, fenceName.c_str(), &g_muxSharedOutFenceHandle);
@@ -1094,6 +1098,8 @@ void SwitchCamera(int deviceIndex) {
 }
 
 void SwitchMode(DirectPortAppMode newMode) {
+    // Resources below may still be referenced by in-flight command lists.
+    WaitForGpu();
     TeardownProducerResources();
     TeardownCameraResources();
     TeardownConsumerResources();
@@ -1195,7 +1201,7 @@ void StepGraph_Discovery() {
 
         // Broadcast the multiplexed grid stream out
         g_broadcaster.Broadcast("DirectPort_Multiplexer", kDefaultWidth, kDefaultHeight, DXGI_FORMAT_B8G8R8A8_UNORM,
-            L"Global\\DirectPortTexture_Multiplexer", L"Global\\DirectPortFence_Multiplexer", g_muxSharedOutFrameValue,
+            g_muxTexName.c_str(), g_muxFenceName.c_str(), g_muxSharedOutFrameValue,
             false, 0, 0, L"");
 
         int count = 0;
@@ -1248,9 +1254,8 @@ void StepGraph_InputAcquire() {
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         g_commandList->ResourceBarrier(1, &barrier);
     } else if (g_mode == MODE_PRODUCER_CAMERA && g_cameraCapture.IsActive()) {
-        // Read camera frame into mapped upload staging buffer
-        DWORD bytesCopied = 0;
-        if (g_cameraCapture.ReadFrame(g_pCameraUploadData, g_cameraUploadSize, &bytesCopied) && bytesCopied > 0) {
+        // Upload only when the camera delivered a new frame; never block on it.
+        if (g_cameraCapture.CopyLatestFrame(g_pCameraUploadData[g_frameIndex], g_cameraRowPitch, g_cameraFrameSerial)) {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             barrier.Transition.pResource = g_cameraTexture.Get();
@@ -1263,7 +1268,7 @@ void StepGraph_InputAcquire() {
             dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dst.SubresourceIndex = 0;
 
-            src.pResource = g_cameraUploadBuffer.Get();
+            src.pResource = g_cameraUploadBuffer[g_frameIndex].Get();
             src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             src.PlacedFootprint.Footprint.Width = g_cameraCapture.GetWidth();
             src.PlacedFootprint.Footprint.Height = g_cameraCapture.GetHeight();
@@ -1582,6 +1587,35 @@ void MoveToNextFrame() {
     g_fenceValues[g_frameIndex] = currentFence + 1;
 }
 
+void WaitForGpu() {
+    if (!g_commandQueue || !g_renderFence) return;
+    const UINT64 value = g_fenceValues[g_frameIndex];
+    g_commandQueue->Signal(g_renderFence.Get(), value);
+    if (g_renderFence->GetCompletedValue() < value) {
+        g_renderFence->SetEventOnCompletion(value, g_fenceEvent);
+        WaitForSingleObject(g_fenceEvent, INFINITE);
+    }
+    g_fenceValues[g_frameIndex] = value + 1;
+}
+
+void ResizeSwapChain(UINT width, UINT height) {
+    if (!g_swapChain || !width || !height) return;
+    WaitForGpu();
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        g_renderTargets[i].Reset();
+        g_fenceValues[i] = g_fenceValues[g_frameIndex];
+    }
+    if (FAILED(g_swapChain->ResizeBuffers(kFrameCount, width, height, DXGI_FORMAT_UNKNOWN,
+                                          DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT))) return;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = g_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        g_swapChain->GetBuffer(i, IID_PPV_ARGS(&g_renderTargets[i]));
+        g_device->CreateRenderTargetView(g_renderTargets[i].Get(), nullptr, rtvHandle);
+        rtvHandle.ptr += g_rtvDescriptorSize;
+    }
+    g_frameIndex = g_swapChain->GetCurrentBackBufferIndex();
+}
+
 void StartAudioPlayback() {
     if (g_audioPlaying) return;
     g_audioPlaying = true;
@@ -1594,7 +1628,7 @@ void StopAudioPlayback() {
         g_audioPlaying = false;
         if (g_hAudioPlayStopEvent) SetEvent(g_hAudioPlayStopEvent);
         if (g_hAudioPlayThread) {
-            WaitForSingleObject(g_hAudioPlayThread, 1000);
+            WaitForSingleObject(g_hAudioPlayThread, INFINITE);
             CloseHandle(g_hAudioPlayThread);
             g_hAudioPlayThread = nullptr;
         }
@@ -1632,8 +1666,16 @@ DWORD WINAPI AudioPlaybackThreadProc(LPVOID) {
         return 1;
     }
 
-    REFERENCE_TIME hnsBufferDuration = 10000000;
-    if (FAILED(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, hnsBufferDuration, 0, pwfx, nullptr))) {
+    // Event-driven: the engine signals `ready` when it wants more samples.
+    REFERENCE_TIME hnsBufferDuration = 2000000; // 200 ms
+    if (FAILED(audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, hnsBufferDuration, 0, pwfx, nullptr))) {
+        CoTaskMemFree(pwfx);
+        CoUninitialize();
+        return 1;
+    }
+    HANDLE ready = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ready || FAILED(audioClient->SetEventHandle(ready))) {
+        if (ready) CloseHandle(ready);
         CoTaskMemFree(pwfx);
         CoUninitialize();
         return 1;
@@ -1652,7 +1694,8 @@ DWORD WINAPI AudioPlaybackThreadProc(LPVOID) {
 
     std::vector<float> sampleBuffer(bufferFrameCount * pwfx->nChannels);
 
-    while (WaitForSingleObject(g_hAudioPlayStopEvent, 10) == WAIT_TIMEOUT) {
+    const HANDLE waits[] = { g_hAudioPlayStopEvent, ready };
+    while (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
         UINT32 padding = 0;
         if (FAILED(audioClient->GetCurrentPadding(&padding))) break;
 
@@ -1677,12 +1720,14 @@ DWORD WINAPI AudioPlaybackThreadProc(LPVOID) {
     }
 
     audioClient->Stop();
+    CloseHandle(ready);
     CoTaskMemFree(pwfx);
     CoUninitialize();
     return 0;
 }
 
 void Cleanup() {
+    WaitForGpu();
     ManageTrayIcon(g_hwnd, false);
     TeardownProducerResources();
     TeardownCameraResources();
@@ -1782,6 +1827,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 return 0;
             }
             break;
+
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED)
+                ResizeSwapChain(LOWORD(lParam), HIWORD(lParam));
+            return 0;
 
         case WM_DESTROY:
             PostQuitMessage(0);

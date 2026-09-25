@@ -1,7 +1,8 @@
 // --- DirectPort_Camera.h ---
 // High-performance Win32 Media Foundation Camera Capture for DirectPort.
-// Reads frames from active UVC webcam into contiguous BGRA/RGBA buffers with zero CPU thrash.
-// Supports device enumeration, multiple cameras, and zero-copy mapped staging upload.
+// The Source Reader runs asynchronously: each finished read stores the frame
+// and requests the next one, so the render loop never blocks on the camera.
+// The render loop copies the newest frame (if any) with CopyLatestFrame().
 
 #pragma once
 
@@ -14,6 +15,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <wrl/client.h>
+#include <wrl/implements.h>
 #include <string>
 #include <vector>
 #include <atomic>
@@ -34,20 +36,15 @@ struct CameraDeviceInfo {
 
 class DirectPortCameraCapture {
 public:
-    DirectPortCameraCapture() 
-        : m_width(0), m_height(0), m_isCapturing(false), m_initializedMF(false), m_deviceIndex(0) {}
+    DirectPortCameraCapture() = default;
+    DirectPortCameraCapture(const DirectPortCameraCapture&) = delete;
+    DirectPortCameraCapture& operator=(const DirectPortCameraCapture&) = delete;
     ~DirectPortCameraCapture() { Shutdown(); }
 
     static std::vector<CameraDeviceInfo> EnumerateCameras() {
         std::vector<CameraDeviceInfo> result;
-        HRESULT hrCom = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-        bool needsUninit = (hrCom == S_OK);
-
-        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if (FAILED(hr)) {
-            if (needsUninit) CoUninitialize();
+        if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL)))
             return result;
-        }
 
         ComPtr<IMFAttributes> pAttributes;
         if (SUCCEEDED(MFCreateAttributes(&pAttributes, 1))) {
@@ -66,31 +63,25 @@ public:
                     } else {
                         info.friendlyName = L"Camera " + std::to_wstring(i);
                     }
-
                     WCHAR* pLink = nullptr;
                     UINT32 cchLink = 0;
                     if (SUCCEEDED(ppDevices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, &pLink, &cchLink)) && pLink) {
                         info.symbolicLink = pLink;
                         CoTaskMemFree(pLink);
                     }
-
                     result.push_back(info);
                     ppDevices[i]->Release();
                 }
                 CoTaskMemFree(ppDevices);
             }
         }
-
         MFShutdown();
-        if (needsUninit) CoUninitialize();
         return result;
     }
 
     bool Initialize(int deviceIndex = 0) {
         Shutdown();
-
-        HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
-        if (FAILED(hr)) return false;
+        if (FAILED(MFStartup(MF_VERSION, MFSTARTUP_FULL))) return false;
         m_initializedMF = true;
 
         ComPtr<IMFAttributes> pAttributes;
@@ -99,10 +90,7 @@ public:
 
         UINT32 count = 0;
         IMFActivate** ppDevices = nullptr;
-        if (FAILED(MFEnumDeviceSources(pAttributes.Get(), &ppDevices, &count)) || count == 0) {
-            return false;
-        }
-
+        if (FAILED(MFEnumDeviceSources(pAttributes.Get(), &ppDevices, &count)) || count == 0) return false;
         if (deviceIndex < 0 || (UINT32)deviceIndex >= count) deviceIndex = 0;
         m_deviceIndex = deviceIndex;
 
@@ -116,111 +104,56 @@ public:
         }
 
         ComPtr<IMFMediaSource> pSource;
-        hr = ppDevices[deviceIndex]->ActivateObject(IID_PPV_ARGS(&pSource));
+        HRESULT hr = ppDevices[deviceIndex]->ActivateObject(IID_PPV_ARGS(&pSource));
         for (UINT32 i = 0; i < count; ++i) ppDevices[i]->Release();
         CoTaskMemFree(ppDevices);
-
         if (FAILED(hr)) return false;
 
+        m_callback = Microsoft::WRL::Make<ReaderCallback>(this);
+        if (!m_callback) return false;
+
         ComPtr<IMFAttributes> pReaderAttributes;
-        if (FAILED(MFCreateAttributes(&pReaderAttributes, 2))) return false;
+        if (FAILED(MFCreateAttributes(&pReaderAttributes, 3))) return false;
         pReaderAttributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, FALSE);
         pReaderAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        pReaderAttributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, m_callback.Get());
+        if (FAILED(MFCreateSourceReaderFromMediaSource(pSource.Get(), pReaderAttributes.Get(), &m_sourceReader))) return false;
 
-        if (FAILED(MFCreateSourceReaderFromMediaSource(pSource.Get(), pReaderAttributes.Get(), &m_sourceReader))) {
+        if (!ChooseFormat()) return false;
+
+        m_frame.assign((size_t)m_width * m_height * 4, 0);
+        m_isCapturing = true;
+        if (FAILED(m_sourceReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, nullptr, nullptr, nullptr))) {
+            Shutdown();
             return false;
         }
+        return true;
+    }
 
-        ComPtr<IMFMediaType> outputType;
-        if (FAILED(MFCreateMediaType(&outputType))) return false;
-        outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-
-        bool formatFound = SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()));
-
-        if (!formatFound) {
-            for (DWORD i = 0; ; ++i) {
-                ComPtr<IMFMediaType> nativeType;
-                hr = m_sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType);
-                if (hr == MF_E_NO_MORE_TYPES || FAILED(hr)) break;
-
-                if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeType.Get()))) {
-                    if (SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()))) {
-                        formatFound = true;
-                        break;
-                    }
-                }
-            }
+    // Copies the newest frame into `pDest` (rows of `destPitch` bytes) if one
+    // arrived since `lastSerial`.  Never blocks on the camera.
+    bool CopyLatestFrame(BYTE* pDest, UINT destPitch, UINT64& lastSerial) {
+        if (!pDest || !m_isCapturing) return false;
+        AcquireSRWLockShared(&m_frameLock);
+        const bool fresh = m_frameSerial != lastSerial;
+        if (fresh) {
+            const size_t rowBytes = (size_t)m_width * 4;
+            for (UINT y = 0; y < m_height; ++y)
+                memcpy(pDest + (size_t)destPitch * y, m_frame.data() + rowBytes * y, rowBytes);
+            lastSerial = m_frameSerial;
         }
-
-        if (!formatFound) return false;
-
-        ComPtr<IMFMediaType> currentType;
-        if (FAILED(m_sourceReader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &currentType))) return false;
-        UINT32 w = 0, h = 0;
-        MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &w, &h);
-        m_width = (w > 0) ? w : 1280;
-        m_height = (h > 0) ? h : 720;
-
-        m_isCapturing = true;
-        return true;
-    }
-
-    bool ReadFrame(BYTE* pDest, size_t destSize, DWORD* pBytesCopied = nullptr) {
-        if (!m_isCapturing || !m_sourceReader || !pDest) return false;
-
-        ComPtr<IMFSample> pSample;
-        DWORD streamFlags = 0;
-        LONGLONG timestamp = 0;
-        HRESULT hr = m_sourceReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &streamFlags, &timestamp, &pSample);
-        if (FAILED(hr) || !pSample) return false;
-
-        ComPtr<IMFMediaBuffer> pBuffer;
-        if (FAILED(pSample->ConvertToContiguousBuffer(&pBuffer))) return false;
-
-        BYTE* pData = nullptr;
-        DWORD currentLength = 0;
-        if (FAILED(pBuffer->Lock(&pData, nullptr, &currentLength))) return false;
-
-        DWORD toCopy = (std::min)((DWORD)destSize, currentLength);
-        memcpy(pDest, pData, toCopy);
-        if (pBytesCopied) *pBytesCopied = toCopy;
-        pBuffer->Unlock();
-
-        return true;
-    }
-
-    bool ReadFrame(std::vector<BYTE>& outBuffer) {
-        if (!m_isCapturing || !m_sourceReader) return false;
-
-        ComPtr<IMFSample> pSample;
-        DWORD streamFlags = 0;
-        LONGLONG timestamp = 0;
-        HRESULT hr = m_sourceReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &streamFlags, &timestamp, &pSample);
-        if (FAILED(hr) || !pSample) return false;
-
-        ComPtr<IMFMediaBuffer> pBuffer;
-        if (FAILED(pSample->ConvertToContiguousBuffer(&pBuffer))) return false;
-
-        BYTE* pData = nullptr;
-        DWORD currentLength = 0;
-        if (FAILED(pBuffer->Lock(&pData, nullptr, &currentLength))) return false;
-
-        outBuffer.resize(currentLength);
-        memcpy(outBuffer.data(), pData, currentLength);
-        pBuffer->Unlock();
-
-        return true;
+        ReleaseSRWLockShared(&m_frameLock);
+        return fresh;
     }
 
     void Shutdown() {
-        if (m_isCapturing) {
-            m_isCapturing = false;
-            if (m_sourceReader) {
-                m_sourceReader->Flush(MF_SOURCE_READER_ALL_STREAMS);
-                m_sourceReader.Reset();
-            }
+        if (m_isCapturing.exchange(false) && m_sourceReader)
+            m_sourceReader->Flush(MF_SOURCE_READER_ALL_STREAMS);
+        if (m_callback) {
+            m_callback->Detach();   // waits for a callback in progress
+            m_callback.Reset();
         }
+        m_sourceReader.Reset();     // breaks the reader <-> callback cycle
         if (m_initializedMF) {
             MFShutdown();
             m_initializedMF = false;
@@ -234,11 +167,104 @@ public:
     const std::wstring& GetDeviceName() const { return m_deviceName; }
 
 private:
+    class ReaderCallback : public Microsoft::WRL::RuntimeClass<
+        Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IMFSourceReaderCallback> {
+    public:
+        explicit ReaderCallback(DirectPortCameraCapture* owner) : m_owner(owner) {}
+        void Detach() {
+            AcquireSRWLockExclusive(&m_lock);
+            m_owner = nullptr;
+            ReleaseSRWLockExclusive(&m_lock);
+        }
+        STDMETHODIMP OnReadSample(HRESULT hr, DWORD, DWORD flags, LONGLONG, IMFSample* sample) override {
+            AcquireSRWLockShared(&m_lock);
+            if (m_owner) m_owner->OnSample(hr, flags, sample);
+            ReleaseSRWLockShared(&m_lock);
+            return S_OK;
+        }
+        STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
+        STDMETHODIMP OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
+    private:
+        SRWLOCK m_lock = SRWLOCK_INIT;
+        DirectPortCameraCapture* m_owner;
+    };
+
+    bool ChooseFormat() {
+        ComPtr<IMFMediaType> outputType;
+        if (FAILED(MFCreateMediaType(&outputType))) return false;
+        outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+
+        bool found = SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()));
+        for (DWORD i = 0; !found; ++i) {
+            ComPtr<IMFMediaType> nativeType;
+            if (FAILED(m_sourceReader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, i, &nativeType))) break;
+            found = SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, nativeType.Get())) &&
+                    SUCCEEDED(m_sourceReader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.Get()));
+        }
+        if (!found) return false;
+
+        ComPtr<IMFMediaType> currentType;
+        if (FAILED(m_sourceReader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &currentType))) return false;
+        UINT32 w = 0, h = 0;
+        MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &w, &h);
+        if (!w || !h) return false;
+        m_width = w;
+        m_height = h;
+        return true;
+    }
+
+    // Runs on a Media Foundation work-queue thread.
+    void OnSample(HRESULT hr, DWORD flags, IMFSample* sample) {
+        if (!m_isCapturing) return;
+        if (FAILED(hr) || (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) {
+            m_isCapturing = false;   // unplugged or taken by an exclusive app
+            return;
+        }
+        if (sample) StoreFrame(sample);
+        if (FAILED(m_sourceReader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, nullptr, nullptr, nullptr)))
+            m_isCapturing = false;
+    }
+
+    void StoreFrame(IMFSample* sample) {
+        ComPtr<IMFMediaBuffer> buffer;
+        if (FAILED(sample->GetBufferByIndex(0, &buffer))) return;
+        const size_t rowBytes = (size_t)m_width * 4;
+
+        // Honour the buffer's real stride (it may be padded or bottom-up).
+        ComPtr<IMF2DBuffer> buffer2d;
+        BYTE* scan0 = nullptr;
+        LONG pitch = 0;
+        BYTE* raw = nullptr;
+        DWORD length = 0;
+        if (SUCCEEDED(buffer.As(&buffer2d)) && SUCCEEDED(buffer2d->Lock2D(&scan0, &pitch))) {
+        } else if (SUCCEEDED(buffer->Lock(&raw, nullptr, &length)) && length >= rowBytes * m_height) {
+            scan0 = raw;
+            pitch = (LONG)rowBytes;
+        } else {
+            if (raw) buffer->Unlock();
+            return;
+        }
+
+        AcquireSRWLockExclusive(&m_frameLock);
+        for (UINT y = 0; y < m_height; ++y)
+            memcpy(m_frame.data() + rowBytes * y, scan0 + (ptrdiff_t)pitch * y, rowBytes);
+        ++m_frameSerial;
+        ReleaseSRWLockExclusive(&m_frameLock);
+
+        if (raw) buffer->Unlock();
+        else buffer2d->Unlock2D();
+    }
+
     ComPtr<IMFSourceReader> m_sourceReader;
-    UINT m_width;
-    UINT m_height;
-    int m_deviceIndex;
+    Microsoft::WRL::ComPtr<ReaderCallback> m_callback;
+    SRWLOCK m_frameLock = SRWLOCK_INIT;
+    std::vector<BYTE> m_frame;          // tightly packed BGRA, width * 4 per row
+    UINT64 m_frameSerial = 0;
+    UINT m_width = 0;
+    UINT m_height = 0;
+    int m_deviceIndex = 0;
     std::wstring m_deviceName;
-    std::atomic<bool> m_isCapturing;
-    bool m_initializedMF;
+    std::atomic<bool> m_isCapturing{ false };
+    bool m_initializedMF = false;
 };
